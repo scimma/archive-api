@@ -1,0 +1,6 @@
+archive-core @ git+https://github.com/scimma/archive-core
+bson
+fastapi
+hop-client
+httpx
+uvicorn[standard]
