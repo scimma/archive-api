@@ -1,0 +1,53 @@
+## hop_type options are "mock" or "hop"
+hop_type = "hop"
+
+## hop_auth API base endpoint to check user authorization
+hop_auth_api_root = "https://admin.dev.hop.scimma.org/hopauth/api"
+## Path to a local hop auth TOML file from which to read credentials
+#hop_local_auth = ""
+## If hop_username is used to provide the username, the associated password
+## must be stored in the HOP_PASSWORD environment variable 
+#hop_username = ""
+## Read hop credentials from AWS secrets manager
+#hop_aws_secret_name = ""
+#hop_aws_secret_region = ""
+
+## Hostname of the hop/Kafka broker
+hop_hostname = "dev.hop.scimma.org"
+hop_port = "9092"
+
+## Kafka consumer group name to track reading progress
+hop_groupname = "local-dev"
+## If true, consume all available messages
+hop_until_eos = true
+## Names of topics to skip reading
+hop_vetoed_topics = ["sys.heartbeat", "sys.heartbeatnew", "__consumer_offsets", "sys.heartbeat-cit"]
+
+read_only = false
+
+## Type of database to use for metadata storage. Valid options are "sql","aws","mock"
+db_type = "sql"
+## Database hostname
+db_host = "db"
+db_username = "archive"
+db_name = "archive"
+## Name of an AWS secret from which to read database connection info
+db_aws_secret_name = ""
+## Name of the AWS region in which to look for the database and AWS secret
+db_aws_region = ""
+
+## Type of the main data storage, valid options: "S3", "mock"
+store_type = "S3"
+## URL for the object store
+store_endpoint_url = "http://object-store:9000"
+## Name of the main object store bucket
+store_primary_bucket = "scimma-alerts"
+## Name of the backup object store bucket
+store_backup_bucket  = "scimma-alerts-backup"
+## Name of the object store region
+store_region_name = ""
+## Frequency of object store logging
+store_log_every = 1
+
+log_level = "DEBUG"
+log_format = ""

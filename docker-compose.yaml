@@ -1,0 +1,86 @@
+version: '3'
+
+networks:
+  internal:
+    external: false
+
+volumes:
+  objectstoredata: {}
+  postgres: {}
+
+services:
+  #
+  # Archive API server: RESTful webserver interface to archived data
+  #
+  api:
+    image: scimma-archive-api:dev
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    container_name: scimma-archive-api
+    entrypoint:
+      - "uvicorn"
+      - "--app-dir=/root"
+      - "--host=0.0.0.0"
+      - "archive_api:app"
+    networks:
+      - internal
+    ports:
+      - 127.0.0.1:8000:8000
+    env_file:
+      - env.default
+      - .env
+    environment:
+      - CONFIG_FILE=/etc/config.toml
+    volumes:
+      - ./config.toml:/etc/config.toml:ro
+  #
+  # Ingest: Script consuming hop messages and storing in archive
+  #
+  ingest:
+    image: scimma-archive-ingest:dev
+    container_name: scimma-archive-ingest
+    networks:
+      - internal
+    env_file:
+      - env.default
+      - .env
+    environment:
+      - CONFIG_FILE=/etc/config.toml
+    volumes:
+      - ./config.toml:/etc/config.toml:ro
+  #
+  # Archive database: SQL database storing archived message metadata
+  #
+  db:
+    image: 'postgres:latest'
+    env_file:
+      - env.default
+      - .env
+    ports:
+      - 127.0.0.1:5432:5432
+    networks:
+      - internal
+    volumes:
+      - postgres:/var/lib/postgresql
+  #
+  # MinIO: S3-compatible object store for archived message data
+  #
+  object-store:
+    image: quay.io/minio/minio:RELEASE.2023-01-31T02-24-19Z
+    container_name: object-store
+    env_file:
+      - env.default
+      - .env
+    ports:
+      - 127.0.0.1:9000:9000
+      - 127.0.0.1:9001:9001
+    networks:
+      - internal
+    command:
+    - server
+    - /data
+    - --console-address
+    - ":9001"
+    volumes:
+      - objectstoredata:/data
