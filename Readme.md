@@ -61,7 +61,7 @@ docker build . -t scimma-archive-ingest:dev
 
 #### Obtain Hopskotch credentials
 
-By default you will need to provide Hopskotch credentials HOP_USERNAME and HOP_PASSWORD in a `.env` file as illustrated in the `env.default` file. Any environment variables defined in `.env` will override the values specified in `env.default`. 
+By default you will need to provide Hopskotch credentials `HOP_USERNAME` and `HOP_PASSWORD` in a `.env` file as illustrated in the `env.default` file. Any environment variables defined in `.env` will override the values specified in `env.default`. 
 
 Obtain Hopskotch credentials for testing purposes from https://admin.dev.hop.scimma.org.
 
@@ -106,7 +106,7 @@ Response content:
 
 #### Stop services and flush data
 
-To terminate the services and purge reset all persistent data volumes, run
+To terminate the services and purge all persistent data volumes, run
 
 ```bash
 docker compose down --remove-orphans --volumes 
