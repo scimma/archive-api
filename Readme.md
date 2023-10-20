@@ -42,20 +42,75 @@ INFO:     Uvicorn running on http://127.0.0.1:8888 (Press CTRL+C to quit)
 
 ### Local testing in Docker Compose
 
-Build and deploy a set of services using Docker Compose by running
+The Docker Compose file defines a local deployment of the following components:
+
+- archive-api: the archive API webserver (http://localhost:8000)
+- archive-db: the archive ingest script
+- archive-ingest: a PostgreSQL database for the archive metadata
+- object-store: an instance of MinIO for S3-compatible object storage for the archive data storage (http://localhost:9001/browser)
+
+#### Build the archive-ingest image
+
+Clone the archive-ingest repo and build the Docker image:
+
+```bash
+git clone git@github.com:scimma/archive-ingest.git
+cd archive-ingest
+docker build . -t scimma-archive-ingest:dev
+```
+
+#### Obtain Hopskotch credentials
+
+By default you will need to provide Hopskotch credentials HOP_USERNAME and HOP_PASSWORD in a `.env` file as illustrated in the `env.default` file. Any environment variables defined in `.env` will override the values specified in `env.default`. 
+
+Obtain Hopskotch credentials for testing purposes from https://admin.dev.hop.scimma.org.
+
+#### Launch services using Docker Compose
+
+Build the archive-api server and launch the services using Docker Compose by running
 
 ```bash
 docker compose up --build -d
 ```
 
-This will launch
+#### Test the API server
 
-- the archive API webserver (http://localhost:8000)
-- the archive ingest script
-- an instance of MinIO for S3-compatible object storage for the archive data storage (http://localhost:9001/browser)
-- a PostgreSQL database for the archive metadata
+Once online, you can browse the logs for the ingest script to find the UUID of an archived message
 
-By default you will need to provide Hopskotch credentials HOP_USERNAME and HOP_PASSWORD in a `.env` file as illustrated in the `env.default` file. Any environment variables defined in `.env` will override the values specified in `env.default`.
+```bash
+docker compose logs ingest
+```
+
+that you can fetch via the archive API using the `client_httpx.py` utility script like so (where you must first source the `.env` file to set the `HOP_USERNAME` and `HOP_PASSWORD` environment variables):
+
+```bash
+$ source .env
+
+$ python scripts/client_httpx.py 21dad234-126d-4ebe-a8ce-53ecf072b12e
+
+first response: ...
+second response: ...
+final response:
+  status: 200
+  headers: Headers({'date': 'Fri, 20 Oct 2023 19:48:32 GMT', 'server': 'uvicorn', 'authentication-info': 'sid=..., data=...', 'transfer-encoding': 'chunked'})
+Response size: 3881
+Response content:
+{
+  'message': {'format': 'voevent', 
+  'content': b'{
+    "ivorn": "ivo://nasa.gsfc.gcn/SWIFT#Actual_Point_Dir_2023-10-20T19:47:01.26_623869523-907", 
+    "role": "utility"', ... , 'con_message_crc32': 1391718911, 'duplicate': False
+    }
+ }
+```
+
+#### Stop services and flush data
+
+To terminate the services and purge reset all persistent data volumes, run
+
+```bash
+docker compose down --remove-orphans --volumes 
+```
 
 ## Docker Image
 

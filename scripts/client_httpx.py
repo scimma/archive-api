@@ -140,8 +140,9 @@ class SCRAMAuth(httpx.Auth):
             self._check_server_final(resp)
     
 async def do():
+    import sys
     async with httpx.AsyncClient() as client:
-        msg_id = '28e900db-1524-4a93-bfdb-c30fd6dfabb1'
+        msg_id = sys.argv[1]
         url = f"http://localhost:8000/msg/{msg_id}"
         resp = await client.get(
             url,

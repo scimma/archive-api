@@ -10,12 +10,108 @@ volumes:
   waitforit: {}
 
 services:
+  # #
+  # # SCIMMA admin database
+  # #
+  # admin-db:
+  #   image: 'postgres:latest'
+  #   container_name: admin-db
+  #   env_file:
+  #     - env.default
+  #     - .env
+  #   ports:
+  #     - 127.0.0.1:5432:5432
+  #   networks:
+  #     - internal
+  #   volumes:
+  #     - postgres:/var/lib/postgresql
+  # #
+  # # SCIMMA admin database semaphore
+  # #
+  # admin-wait-for-db:
+  #   image: 'postgres:latest'
+  #   container_name: admin-wait-for-db
+  #   env_file:
+  #     - env.default
+  #     - .env
+  #   networks:
+  #     - internal
+  #   command:
+  #     - sh
+  #     - -c
+  #     - >
+  #       until pg_isready \
+  #           --username=${POSTGRES_USER} \
+  #           --dbname=${POSTGRES_DB} \
+  #           --host=admin-db \
+  #           --port=5432;
+  #         do echo waiting for database;
+  #         sleep 2;
+  #         done;
+  #         touch /tmp/db_ready_admin;
+  #   volumes:
+  #     - waitforit:/tmp
+  # #
+  # # SCIMMA admin init
+  # #
+  # admin-init:
+  #   image: scimma-admin:dev
+  #   build:
+  #     context: /home/andrew/work/Projects/SCiMMA/src/scimma/scimma-admin
+  #   container_name: admin-init
+  #   env_file:
+  #     - env.default
+  #     - .env
+  #   networks:
+  #     - internal
+  #   entrypoint:
+  #     - '/bin/bash'
+  #     - '-c'
+  #     - >
+  #       while [[ ! -f /tmp/db_ready_admin ]]; do
+  #         echo waiting for database...;
+  #         sleep 2;
+  #       done;
+  #       cd /app/scimma_admin && python3 manage.py migrate && python3 manage.py makemigrations && touch /tmp/admin_init_complete
+  #   volumes:
+  #     - waitforit:/tmp
+  # #
+  # # SCIMMA admin webserver
+  # #
+  # admin:
+  #   image: scimma-admin:dev
+  #   build:
+  #     context: /home/andrew/work/Projects/SCiMMA/src/scimma/scimma-admin
+  #     # args:
+  #     #   - OIDC_RP_CLIENT_ID=dummy
+  #     #   - OIDC_RP_CLIENT_SECRET=dummy
+  #       # - OIDC_OP_AUTHORIZATION_ENDPOINT=${OIDC_OP_AUTHORIZATION_ENDPOINT}
+  #       # - OIDC_OP_TOKEN_ENDPOINT=${OIDC_OP_TOKEN_ENDPOINT}
+  #       # - OIDC_OP_USER_ENDPOINT=${OIDC_OP_USER_ENDPOINT}
+  #       # - OIDC_RP_SIGN_ALGO=${OIDC_RP_SIGN_ALGO}
+  #       # - OIDC_OP_JWKS_ENDPOINT=${OIDC_OP_JWKS_ENDPOINT}
+  #   container_name: admin
+  #   networks:
+  #     - internal
+  #   ports:
+  #     - 127.0.0.1:8000:8000
+  #   env_file:
+  #     - env.default
+  #     - .env
+  #   entrypoint:
+  #     - '/bin/bash'
+  #     - '-c'
+  #     - >
+  #       while [[ ! -f /tmp/admin_init_complete ]]; do
+  #         echo waiting for initialization...;
+  #         sleep 2;
+  #       done;
   #
-  # SCIMMA admin database
+  # Archive database: SQL database storing archived message metadata
   #
-  admin-db:
+  archive-db:
     image: 'postgres:latest'
-    container_name: admin-db
+    container_name: archive-db
     env_file:
       - env.default
       - .env
@@ -25,87 +121,6 @@ services:
       - internal
     volumes:
       - postgres:/var/lib/postgresql
-  #
-  # SCIMMA admin database semaphore
-  #
-  admin-wait-for-db:
-    image: 'postgres:latest'
-    container_name: admin-wait-for-db
-    env_file:
-      - env.default
-      - .env
-    networks:
-      - internal
-    command:
-      - sh
-      - -c
-      - >
-        until pg_isready \
-            --username=${POSTGRES_USER} \
-            --dbname=${POSTGRES_DB} \
-            --host=admin-db \
-            --port=5432;
-          do echo waiting for database;
-          sleep 2;
-          done;
-          touch /tmp/db_ready_admin;
-    volumes:
-      - waitforit:/tmp
-  #
-  # SCIMMA admin init
-  #
-  admin-init:
-    image: scimma-admin:dev
-    build:
-      context: /home/andrew/work/Projects/SCiMMA/src/scimma/scimma-admin
-    container_name: admin-init
-    env_file:
-      - env.default
-      - .env
-    networks:
-      - internal
-    entrypoint:
-      - '/bin/bash'
-      - '-c'
-      - >
-        while [[ ! -f /tmp/db_ready_admin ]]; do
-          echo waiting for database...;
-          sleep 2;
-        done;
-        cd /app/scimma_admin && python3 manage.py migrate && python3 manage.py makemigrations && touch /tmp/admin_init_complete
-    volumes:
-      - waitforit:/tmp
-  #
-  # SCIMMA admin webserver
-  #
-  admin:
-    image: scimma-admin:dev
-    build:
-      context: /home/andrew/work/Projects/SCiMMA/src/scimma/scimma-admin
-      # args:
-      #   - OIDC_RP_CLIENT_ID=dummy
-      #   - OIDC_RP_CLIENT_SECRET=dummy
-        # - OIDC_OP_AUTHORIZATION_ENDPOINT=${OIDC_OP_AUTHORIZATION_ENDPOINT}
-        # - OIDC_OP_TOKEN_ENDPOINT=${OIDC_OP_TOKEN_ENDPOINT}
-        # - OIDC_OP_USER_ENDPOINT=${OIDC_OP_USER_ENDPOINT}
-        # - OIDC_RP_SIGN_ALGO=${OIDC_RP_SIGN_ALGO}
-        # - OIDC_OP_JWKS_ENDPOINT=${OIDC_OP_JWKS_ENDPOINT}
-    container_name: admin
-    networks:
-      - internal
-    ports:
-      - 127.0.0.1:8000:8000
-    env_file:
-      - env.default
-      - .env
-    entrypoint:
-      - '/bin/bash'
-      - '-c'
-      - >
-        while [[ ! -f /tmp/admin_init_complete ]]; do
-          echo waiting for initialization...;
-          sleep 2;
-        done;
   #
   # Archive API server database semaphore
   #
@@ -140,7 +155,7 @@ services:
     build:
       context: .
       dockerfile: ./Dockerfile
-    container_name: scimma-archive-api
+    container_name: archive-api
     entrypoint:
       - '/bin/bash'
       - '-c'
@@ -149,7 +164,7 @@ services:
           echo waiting for database...;
           sleep 2;
         done;
-      - "uvicorn --app-dir=/root --host=0.0.0.0 archive_api:app"
+        uvicorn --app-dir=/root --host=0.0.0.0 archive_api:app
     networks:
       - internal
     ports:
@@ -160,13 +175,14 @@ services:
     environment:
       - CONFIG_FILE=/etc/config.toml
     volumes:
+      - waitforit:/tmp
       - ./config.toml:/etc/config.toml:ro
   #
   # Ingest: Script consuming hop messages and storing in archive
   #
   ingest:
     image: scimma-archive-ingest:dev
-    container_name: scimma-archive-ingest
+    container_name: archive-ingest
     networks:
       - internal
     env_file:
@@ -174,22 +190,18 @@ services:
       - .env
     environment:
       - CONFIG_FILE=/etc/config.toml
+    entrypoint:
+      - '/bin/bash'
+      - '-c'
+      - >
+        while [[ ! -f /tmp/db_ready_archive ]]; do
+          echo waiting for database...;
+          sleep 2;
+        done;
+        /root/archive_ingest.py
     volumes:
+      - waitforit:/tmp
       - ./config.toml:/etc/config.toml:ro
-  #
-  # Archive database: SQL database storing archived message metadata
-  #
-  archive-db:
-    image: 'postgres:latest'
-    env_file:
-      - env.default
-      - .env
-    ports:
-      - 127.0.0.1:5432:5432
-    networks:
-      - internal
-    volumes:
-      - postgres:/var/lib/postgresql
   #
   # MinIO: S3-compatible object store for archived message data
   #
