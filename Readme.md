@@ -46,7 +46,7 @@ The Docker Compose file defines a local deployment of the following components:
 
 - archive-api: the archive API webserver (http://localhost:8000)
 - archive-db: a PostgreSQL database for the archive metadata
-- archive-ingest: the script that consumes Hopskotch messages and stores them in the archive db
+- archive-ingest: the script that consumes Hopskotch messages and stores their metadata in the archive db and their payload in the object store
 - object-store: an instance of MinIO for S3-compatible object storage for the archive data storage (http://localhost:9001/browser)
 
 #### Build the archive-ingest image
