@@ -45,8 +45,8 @@ INFO:     Uvicorn running on http://127.0.0.1:8888 (Press CTRL+C to quit)
 The Docker Compose file defines a local deployment of the following components:
 
 - archive-api: the archive API webserver (http://localhost:8000)
-- archive-db: the archive ingest script
-- archive-ingest: a PostgreSQL database for the archive metadata
+- archive-db: a PostgreSQL database for the archive metadata
+- archive-ingest: the script that consumes Hopskotch messages and stores them in the archive db
 - object-store: an instance of MinIO for S3-compatible object storage for the archive data storage (http://localhost:9001/browser)
 
 #### Build the archive-ingest image
