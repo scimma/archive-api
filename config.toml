@@ -19,7 +19,7 @@ hop_port = "9092"
 ## Kafka consumer group name to track reading progress
 hop_groupname = "local-dev"
 ## If true, consume all available messages
-hop_until_eos = true
+hop_until_eos = false
 ## Names of topics to skip reading
 hop_vetoed_topics = ["sys.heartbeat", "sys.heartbeatnew", "__consumer_offsets", "sys.heartbeat-cit"]
 
@@ -28,7 +28,7 @@ read_only = false
 ## Type of database to use for metadata storage. Valid options are "sql","aws","mock"
 db_type = "sql"
 ## Database hostname
-db_host = "db"
+db_host = "archive-db"
 db_username = "archive"
 db_name = "archive"
 ## Name of an AWS secret from which to read database connection info
