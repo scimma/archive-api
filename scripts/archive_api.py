@@ -107,7 +107,9 @@ async def fetch_message(msg_id: Annotated[str, Path(title="The ID of message ite
 	              f"and was on topic {metadata.topic}")
 	
 	# Check whether the message is public; if so we can immediately return it to the user
-	# TODO: this information is not currently stored in the DB, so we cannot implement this check
+	if metadata.public:
+		return StreamingResponse(stream_s3_response(await archiveClient.get_object_lazily(metadata.key)),
+	                         headers=resp_headers)
 	
 	# Query hopauth to find out if the user is allowed to read this message.
 	# This requires authenticating the user to hopauth.
@@ -373,7 +375,9 @@ async def fetch_raw_message(msg_id: Annotated[str, Path(title="The ID of message
 	              f"and was on topic {metadata.topic}")
 	
 	# Check whether the message is public; if so we can immediately return it to the user
-	# TODO: this information is not currently stored in the DB, so we cannot implement this check
+	if metadata.public:
+		return StreamingResponse(stream_raw_payload(await archiveClient.get_object_lazily(metadata.key)),
+		                         headers=resp_headers)
 	
 	# Query hopauth to find out if the user is allowed to read this message.
 	# This requires authenticating the user to hopauth.
@@ -606,7 +610,10 @@ async def write_message(request: Request,
 			return Response(status_code=400, content=f"Message key is not binary or a string")
 		key = data["key"]
 	metadata = hop.io.Metadata(topic_name, 0, 0, timestamp, key, headers, None)
-	stored, reason = await archiveClient.store_message(payload, metadata)
+	# TODO: This marks all direct uploads as public; 
+	#       in general we should set this based on whether the target topic is public.
+	stored, reason = await archiveClient.store_message(payload, metadata,
+	                                                   public=True, direct_upload=True)
 	
 	if stored:
 		return Response(status_code=201, headers=resp_headers)
