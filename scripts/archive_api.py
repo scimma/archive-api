@@ -5,6 +5,7 @@ from fastapi.responses import Response, JSONResponse, StreamingResponse
 
 import argparse
 import collections
+import enum
 import logging
 import os
 import struct
@@ -62,7 +63,7 @@ def effective_topic_name_for_access(topic_name: str):
 	topic's name to perform all access queries.
 	
 	Args:
-		topic_name: name of topic to which a user has requetsed access
+		topic_name: name of topic to which a user has requested access
 		
 	Returns: The effective topic name which should be used to query whether the user's access is
 			 allowed
@@ -106,7 +107,9 @@ async def fetch_message(msg_id: Annotated[str, Path(title="The ID of message ite
 	              f"and was on topic {metadata.topic}")
 	
 	# Check whether the message is public; if so we can immediately return it to the user
-	# TODO: this information is not currently stored in the DB, so we cannot implement this check
+	if metadata.public:
+		return StreamingResponse(stream_s3_response(await archiveClient.get_object_lazily(metadata.key)),
+	                         headers=resp_headers)
 	
 	# Query hopauth to find out if the user is allowed to read this message.
 	# This requires authenticating the user to hopauth.
@@ -134,6 +137,276 @@ async def fetch_message(msg_id: Annotated[str, Path(title="The ID of message ite
 	
 	# If the user is authorized, fetch the message from S3 and stream it back
 	return StreamingResponse(stream_s3_response(await archiveClient.get_object_lazily(metadata.key)),
+	                         headers=resp_headers)
+
+
+async def stream_raw_payload(s3_result):
+	def anext(iterator, default=None):
+		__anext__ = type(iterator).__anext__
+		async def anext_impl():
+			try:
+				return await __anext__(iterator)
+			except StopAsyncIteration:
+				return default
+		return anext_impl()
+	
+	iterator = s3_result['Body'].__aiter__()
+	current_chunk = await anext(iterator, None)
+	if current_chunk is None:
+		return
+	
+	current_offset = 0
+	len_remaining = 0
+	
+	async def read(amount: int):
+		nonlocal current_chunk
+		nonlocal current_offset
+		nonlocal len_remaining
+		value = bytearray()
+		while current_chunk is not None and amount > 0:
+			clen = len(current_chunk)
+			if amount <= clen:
+				value += current_chunk[current_offset:current_offset+amount]
+				current_offset += amount
+				amount = 0
+			else:
+				value += current_chunk[current_offset:]
+				amount -= (clen - current_offset)
+				current_offset = clen
+			if current_offset >= clen:
+				current_chunk = await anext(iterator, None)
+				current_offset = 0
+		if current_chunk is None and amount > 0:
+			raise ValueError("read: Early end of data stream")
+		len_remaining -= len(value)
+		return value
+
+	async def ignore(amount: int):
+		nonlocal current_chunk
+		nonlocal current_offset
+		nonlocal len_remaining
+		while current_chunk is not None and amount > 0:
+			clen = len(current_chunk)
+			if amount <= clen:
+				current_offset += amount
+				len_remaining -= amount
+				amount = 0
+			else:
+				amount -= (clen - current_offset)
+				len_remaining -= (clen - current_offset)
+				current_offset = clen
+			if current_offset >= clen:
+				current_chunk = await anext(iterator, None)
+				current_offset = 0
+		if current_chunk is None and amount > 0:
+			raise ValueError("ignore: Early end of data stream")
+
+	async def send(amount: int):
+		nonlocal current_chunk
+		nonlocal current_offset
+		nonlocal len_remaining
+		while current_chunk is not None and amount > 0:
+			clen = len(current_chunk)
+			if amount <= clen:
+				yield current_chunk[current_offset:current_offset+amount]
+				current_offset += amount
+				len_remaining -= amount
+				amount = 0
+			else:
+				yield current_chunk[current_offset:]
+				amount -= (clen - current_offset)
+				len_remaining -= (clen - current_offset)
+				current_offset = clen
+			if current_offset >= clen:
+				current_chunk = await anext(iterator, None)
+				current_offset = 0
+		if current_chunk is None and amount > 0:
+			raise ValueError("send: Early end of data stream")
+			
+	async def read_cstring():
+		value = bytearray()
+		while True:
+			c = await read(1)
+			if c == b'\x00':
+				return value.decode("utf-8")
+			value.extend(c)
+	
+	def decode_int32(data):
+		return struct.unpack("<i", data)[0]
+	
+	@enum.unique
+	class BSONType(enum.Enum):
+		double =      0x01
+		string =      0x02
+		document =    0x03
+		array =       0x04
+		binary =      0x05
+		undefined =   0x06
+		object_id =   0x07
+		bool =        0x08
+		datetime =    0x09
+		null =        0x0A
+		regex =       0x0B
+		db_pointer =  0x0C
+		javascript =  0x0D
+		symbol =      0x0E
+		scoped_code = 0x0F
+		int32 =       0x10
+		timestamp =   0x11
+		int64 =       0x12
+		decimal128 =  0x13
+		min_key =     0xFF
+		max_key =     0x7F
+
+	try:
+		len_remaining = decode_int32(await read(4))
+# 		print("Full document length:", len_remaining)
+		len_remaining -= 4
+		while len_remaining > 1:  # expect one byte for end of document
+			raw_e_type = await read(1)
+# 			print("  Element type:", raw_e_type.hex())
+			if raw_e_type[0] == 0:  # end of document
+				break
+			if len_remaining < 2:
+				raise ValueError("Malformed document")
+			try:
+				e_type = BSONType(raw_e_type[0])
+			except ValueError:
+				logging.warning(f"Unexpected element type for BSON 1.1: 0x{raw_e_type.hex()}")
+				return
+			e_name = await read_cstring()
+# 			print("  Element name:", e_name)
+			if len_remaining < 1:
+				raise ValueError("Malformed document")
+
+			# If this is our blessed sub-object, extract it
+			if e_type == BSONType.document and e_name == "message":
+				raw_dlen = await read(4)
+				dlen = decode_int32(raw_dlen)
+				if dlen < 5:
+					raise ValueError("Malformed document: Too small length for embedded document")
+				dlen -= 4  # we already consumed the length
+				if dlen >= len_remaining:
+					raise ValueError("Malformed document: embedded document longer than remainder of document")
+				yield bytes(raw_dlen)
+				async for chunk in send(dlen):
+					yield bytes(chunk)
+				# We don't really care what else was in the document; we won't send it, so skip
+				# reading and parsing it
+				return
+
+			# Otherwise, this is just something to skip over
+			if e_type == BSONType.double or e_type == BSONType.datetime \
+					or e_type == BSONType.timestamp or e_type == BSONType.int64:
+				await ignore(8)
+			elif e_type == BSONType.string or e_type == BSONType.javascript \
+					 or e_type == BSONType.symbol:
+				slen = decode_int32(await read(4))
+				if slen >= len_remaining:
+					raise ValueError("Malformed document: string longer than remainder of document")
+				await ignore(slen)
+			elif e_type == BSONType.document or e_type == BSONType.array:
+				dlen = decode_int32(await read(4))
+# 				print("    Document length:", dlen)
+				if dlen < 5:
+					raise ValueError("Malformed document: Too small length for embedded document")
+				dlen -= 4  # we already consumed the length
+				if dlen >= len_remaining:
+					raise ValueError("Malformed document: embedded document longer than remainder of document")
+				await ignore(dlen)
+# 				print("    Done skipping document, length remaining:", len_remaining)
+			elif e_type == BSONType.undefined or e_type == BSONType.null \
+					or e_type == BSONType.min_key or e_type == BSONType.max_key:
+				pass  # zero size element; nothing to do
+			elif e_type == BSONType.object_id:
+				await ignore(12)
+			elif e_type == BSONType.bool:
+				await ignore(1)
+			elif e_type == BSONType.regex:
+				_ = await read_cstring()
+				_ = await read_cstring()
+			elif e_type == BSONType.db_pointer:
+				slen = decode_int32(await read(4))
+				if slen >= len_remaining:
+					raise ValueError("Malformed document: DB pointer string longer than remainder of document")
+				await ignore(slen + 12)
+			elif e_type == BSONType.scoped_code:
+				clen = decode_int32(await read(4))
+				if clen < 10:
+					raise ValueError("Malformed document: Too small length for code with scope")
+				clen -= 4  # we already consumed the length
+				if clen >= len_remaining:
+					raise ValueError("Malformed document: code with scope longer than remainder of document")
+				await ignore(clen)
+			elif e_type == BSONType.int32:
+				await ignore(4)
+			elif e_type == BSONType.decimal128:
+				await ignore(16)
+			else:
+				raise ValueError("Internal Error: uncovered e_type")
+	except ValueError as err:
+		logging.warning(f"BSON decoding error: {err}")
+		return
+	except struct.error as err:
+		logging.warning(f"BSON decoding error: {err}")
+		return
+
+
+@app.get("/msg/{msg_id}/raw_file/{file_name}")
+async def fetch_raw_message(msg_id: Annotated[str, Path(title="The ID of message item to get")],
+                            file_name: Annotated[str, Path(title="Name to treat the payload as having")],
+                            authorization: Annotated[Union[str, None], Header()] = None,
+                            ):
+	resp_headers={}
+	
+	# First, make sure the message ID supplied by user is something safe and sane
+	try:
+		# overwrite the variable to normalize
+		msg_id = uuid.UUID(msg_id)
+	except ValueError:
+		return Response(status_code=400, content="Invalid Message ID")
+	
+	# Get the record, if any, of the message
+	metadata = await archiveClient.get_metadata(msg_id)
+	if not metadata:
+		return Response(status_code=404, content="Message not found")
+	
+	logging.debug(f"message lives at key {metadata.key} in bucket {metadata.bucket} "
+	              f"and was on topic {metadata.topic}")
+	
+	# Check whether the message is public; if so we can immediately return it to the user
+	if metadata.public:
+		return StreamingResponse(stream_raw_payload(await archiveClient.get_object_lazily(metadata.key)),
+		                         headers=resp_headers)
+	
+	# Query hopauth to find out if the user is allowed to read this message.
+	# This requires authenticating the user to hopauth.
+	if authorization is None:
+		return default_not_authorized();
+
+	auth_query_url = f"{config['hop_auth_api_root']}/v1/current_credential/permissions/topic/" \
+		f"{effective_topic_name_for_access(metadata.topic)}"
+	resp = await httpClient.get(auth_query_url, headers={"Authorization": authorization})
+	if resp.status_code == 401 and "www-authenticate" in resp.headers:
+		return Response(status_code=401, content=resp.content, 
+						headers={"www-authenticate": resp.headers["www-authenticate"]})
+	if resp.status_code != 200:
+		return Response(status_code=500, content="Internal Error")
+	if "authentication-info" in resp.headers:
+		resp_headers["authentication-info"] = resp.headers["authentication-info"]
+	# After this point it is important to always return a response with resp_headers
+	# as the client may be expecting the authentication-info!
+	
+	allowed_ops = resp.json()["allowed_operations"]
+	if not isinstance(allowed_ops, collections.Sequence):
+		return Response(status_code=500, content="Internal Error", headers=resp_headers)
+	if not "Read" in allowed_ops:
+		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
+	
+	resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
+	
+	# If the user is authorized, fetch the message from S3 and stream it back
+	return StreamingResponse(stream_raw_payload(await archiveClient.get_object_lazily(metadata.key)),
 	                         headers=resp_headers)
 
 
@@ -169,7 +442,7 @@ async def stream_message_list(archiveClient, db_records, next_offset):
 		message_keys.append(key)
 	total_size += array_size
 	
-	# Knowing the total size, we can now build the part of the document that preceds the first
+	# Knowing the total size, we can now build the part of the document that precedes the first
 	# message blob.
 	header = BytesIO()
 	header.write(struct.pack("<i", total_size)) # overall document size
@@ -337,7 +610,10 @@ async def write_message(request: Request,
 			return Response(status_code=400, content=f"Message key is not binary or a string")
 		key = data["key"]
 	metadata = hop.io.Metadata(topic_name, 0, 0, timestamp, key, headers, None)
-	stored, reason = await archiveClient.store_message(payload, metadata)
+	# TODO: This marks all direct uploads as public; 
+	#       in general we should set this based on whether the target topic is public.
+	stored, reason = await archiveClient.store_message(payload, metadata,
+	                                                   public=True, direct_upload=True)
 	
 	if stored:
 		return Response(status_code=201, headers=resp_headers)
