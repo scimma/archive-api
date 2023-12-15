@@ -280,15 +280,14 @@ async def stream_raw_payload(s3_result):
 				raise ValueError("Malformed document")
 
 			# If this is our blessed sub-object, extract it
-			if e_type == BSONType.document and e_name == "message":
+			if e_type == BSONType.binary and e_name == "message":
 				raw_dlen = await read(4)
 				dlen = decode_int32(raw_dlen)
-				if dlen < 5:
-					raise ValueError("Malformed document: Too small length for embedded document")
-				dlen -= 4  # we already consumed the length
-				if dlen >= len_remaining:
-					raise ValueError("Malformed document: embedded document longer than remainder of document")
-				yield bytes(raw_dlen)
+				# plus one byte for subtype
+				if dlen + 1 >= len_remaining:
+					raise ValueError("Malformed binary: embedded binary longer than remainder of document")
+				# No one really cares what the subtype is; just extract and discard
+				subtype = await read(1)
 				async for chunk in send(dlen):
 					yield bytes(chunk)
 				# We don't really care what else was in the document; we won't send it, so skip
@@ -315,6 +314,13 @@ async def stream_raw_payload(s3_result):
 					raise ValueError("Malformed document: embedded document longer than remainder of document")
 				await ignore(dlen)
 # 				print("    Done skipping document, length remaining:", len_remaining)
+			elif e_type == BSONType.binary:
+				raw_dlen = await read(4)
+				dlen = decode_int32(raw_dlen)
+				# plus one byte for subtype
+				if dlen + 1 >= len_remaining:
+					raise ValueError("Malformed binary: embedded binary longer than remainder of document")
+				await ignore(dlen + 1)
 			elif e_type == BSONType.undefined or e_type == BSONType.null \
 					or e_type == BSONType.min_key or e_type == BSONType.max_key:
 				pass  # zero size element; nothing to do
@@ -343,7 +349,7 @@ async def stream_raw_payload(s3_result):
 			elif e_type == BSONType.decimal128:
 				await ignore(16)
 			else:
-				raise ValueError("Internal Error: uncovered e_type")
+				raise ValueError(f"Internal Error: uncovered e_type: {e_type.value}")
 	except ValueError as err:
 		logging.warning(f"BSON decoding error: {err}")
 		return
@@ -376,6 +382,7 @@ async def fetch_raw_message(msg_id: Annotated[str, Path(title="The ID of message
 	
 	# Check whether the message is public; if so we can immediately return it to the user
 	if metadata.public:
+		resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
 		return StreamingResponse(stream_raw_payload(await archiveClient.get_object_lazily(metadata.key)),
 		                         headers=resp_headers)
 	
