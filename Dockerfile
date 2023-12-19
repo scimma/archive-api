@@ -8,4 +8,4 @@ RUN dnf install -y git && \
     dnf remove -y git && dnf autoremove
 ADD scripts/archive_api.py /root/archive_api.py
 WORKDIR /tmp
-ENTRYPOINT ["uvicorn", "--app-dir=/root", "archive_api:app"]
+ENTRYPOINT ["uvicorn", "--app-dir=/root", "--port=80", "archive_api:app"]
