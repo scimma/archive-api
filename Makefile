@@ -20,7 +20,7 @@ container: Dockerfile
 
 set-release-tags:
 	@$(eval TAG_SUFFIX := $(shell if [ ! -z "$$(git status --porcelain)" ]; then echo '-modified'; fi))
-	@$(eval RELEASE_TAG := $(shell git describe --tags --abbrev=0 | awk -F- '{print $$2}')"$(TAG_SUFFIX)")
+	@$(eval RELEASE_TAG := $(shell git describe --tags --abbrev=0 | sed 's/^[^0-9]*//')"$(TAG_SUFFIX)")
 	@echo RELEASE_TAG =  $(RELEASE_TAG)
 	@$(eval MAJOR_TAG   := $(shell echo $(RELEASE_TAG) | awk -F. '{print $$1}'))
 	@echo MAJOR_TAG = $(MAJOR_TAG)
