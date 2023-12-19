@@ -50,6 +50,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/health_check")
+async def health_check():
+	try:
+		# we don't care if there is a message with this UUID,
+		# we just want to see if we can make queries
+		await archiveClient.db.uuid_in_db(uuid.UUID("00000000-0000-0000-0000-000000000000"))
+		database_ok = True
+	except:
+		database_ok = False
+	try:
+		# again, the existence of the specific object is not important
+		await archiveClient.store.get_object_lazily("not/a/valid/object/key")
+		store_ok = True
+	except:
+		store_ok = False
+	try:
+		# only the status of the response matters
+		resp = await httpClient.get(f"{config['hop_auth_api_root']}/version")
+		hop_auth_ok = resp.status_code == 200
+	except:
+		hop_auth_ok = False
+	return {"DatabaseOK": database_ok,
+	        "ObjectStoreOK": store_ok,
+	        "HopAuthOK": hop_auth_ok,
+	       }
+
 def effective_topic_name_for_access(topic_name: str):
 	"""
 	Compute the topic name which should be used for querying access control.
