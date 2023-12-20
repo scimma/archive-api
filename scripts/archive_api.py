@@ -13,6 +13,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
+from urllib.parse import unquote
 
 import httpx
 import bson
@@ -585,6 +586,7 @@ async def write_message(request: Request,
 	if authorization is None:
 		return default_not_authorized();
 
+	topic_name = unquote(topic_name)
 	auth_query_url = f"{config['hop_auth_api_root']}/v1/current_credential/permissions/topic/" \
 		f"{effective_topic_name_for_access(topic_name)}"
 	
@@ -627,13 +629,15 @@ async def write_message(request: Request,
 		                headers=resp_headers)
 	payload = data["message"]
 	if "headers" in data:
-		for key, value in data["headers"].items():
+		headers = data["headers"]
+		if isinstance(headers, collections.Mapping):
+			headers = list(headers.items())
+		for key, value in headers:
 			if not _is_bytes_like(value):
 				logging.warning(f"Header with key {key} is not binary data")
 				return Response(status_code=400,
 				                content=f"Header with key {key} is not binary data",
 				                headers=resp_headers)
-		headers = data["headers"]
 	else:
 		headers = []
 	# TODO: is this always correct in terms of timezone, precision, etc?
