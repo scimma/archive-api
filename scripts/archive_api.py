@@ -625,8 +625,7 @@ async def write_message(request: Request,
 		logging.warning(f"Missing message key in request body")
 		return Response(status_code=400, content=f"Missing message key in request body",
 		                headers=resp_headers)
-	# TODO: this silly wrapper dictionary should go away
-	payload = {"content": data["message"]}
+	payload = data["message"]
 	if "headers" in data:
 		for key, value in data["headers"].items():
 			if not _is_bytes_like(value):
