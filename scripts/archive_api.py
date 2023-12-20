@@ -613,24 +613,27 @@ async def write_message(request: Request,
 		data = bson.loads(raw_data)
 	except Exception as ex:
 		logging.warning(str(ex))
-		return Response(status_code=400, content="Request must be valid BSON")
+		return Response(status_code=400, content="Request must be valid BSON", headers=resp_headers)
 	logging.debug(f"Decoded request body: {data}")
 	allowed_data_keys = {"message", "headers", "key"}
 	for key in data.keys():
 		if key not in allowed_data_keys:
 			logging.warning(f"Unsupported key in request body: {key}")
-			return Response(status_code=400, content=f"Unsupported key in request body: {key}")
+			return Response(status_code=400, content=f"Unsupported key in request body: {key}",
+			                headers=resp_headers)
 	if "message" not in data:
 		logging.warning(f"Missing message key in request body")
-		return Response(status_code=400, content=f"Missing message key in request body")
+		return Response(status_code=400, content=f"Missing message key in request body",
+		                headers=resp_headers)
 	# TODO: this silly wrapper dictionary should go away
 	payload = {"content": data["message"]}
 	if "headers" in data:
-		for key, value in data["headers"]:
+		for key, value in data["headers"].items():
 			if not _is_bytes_like(value):
 				logging.warning(f"Header with key {key} is not binary data")
 				return Response(status_code=400,
-				                content=f"Header with key {key} is not binary data")
+				                content=f"Header with key {key} is not binary data",
+				                headers=resp_headers)
 		headers = data["headers"]
 	else:
 		headers = []
@@ -640,7 +643,8 @@ async def write_message(request: Request,
 	key = b""
 	if "key" in data:
 		if not _is_bytes_like(data["key"]) and not isinstance(data["key"], str):
-			return Response(status_code=400, content=f"Message key is not binary or a string")
+			return Response(status_code=400, content=f"Message key is not binary or a string",
+			                headers=resp_headers)
 		key = data["key"]
 	metadata = hop.io.Metadata(topic_name, 0, 0, timestamp, key, headers, None)
 	# TODO: This marks all direct uploads as public; 
