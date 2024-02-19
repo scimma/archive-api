@@ -872,7 +872,13 @@ def _is_bytes_like(obj):
                                      "type": "array",
                                      "description": "The Kafka headers attached to the message. "
                                                     "This must be either an array of 2-tuples mapping "
-                                                    "strings to binary blobs, or an equivalent dictionary/object.",
+                                                    "strings to binary blobs, or an equivalent dictionary/object. "
+                                                    "One particularly important header is the _id header, "
+                                                    "whose value should be the binary representation of a "
+                                                    "UUID which the sender wishes to associate with the "
+                                                    "mesasge. "
+                                                    "See https://hop-client.readthedocs.io/en/stable/user/stream.html#standard-headers "
+                                                    "for more information on Hopskotch message headers. ",
                                      "items": {
                                          "type": "array",
                                          "minItems": 2,
