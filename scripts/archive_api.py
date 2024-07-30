@@ -2,6 +2,7 @@ from typing import Union
 from typing_extensions import Annotated
 from fastapi import FastAPI, Header, Path, Query, Request, status
 from fastapi.responses import Response, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 import argparse
 import collections
@@ -26,6 +27,12 @@ utility_api.add_parser_options(parser)
 access_api.add_parser_options(parser)
 parser.add_argument("--hop-auth-api-root", help="Root URL for the hopauth REST API", type=str, 
                     action=utility_api.EnvDefault, envvar="HOP_AUTH_API_ROOT", required=False)
+parser.add_argument("--cors-origins", help="Origin URLs to trust for CORS purposes", type=str, 
+                    action=utility_api.EnvDefault, envvar="CORS_ORIGINS", required=False, nargs='*',
+                    default=[])
+parser.add_argument("--cors-origin-regex", help="Regex for origin URLs to trust for CORS purposes",
+                    type=str, action=utility_api.EnvDefault, envvar="CORS_ORIGIN_REGEX", required=False,
+                    default="")
 # intentionally 'parse' an empty list of arguments to set defaults
 raw_config = parser.parse_args([])
 if "CONFIG_FILE" in os.environ:
@@ -52,6 +59,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan,
               title="Archive API",
               summary="REST API for the Hopskotch Archive")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config["cors_origins"],
+    allow_origin_regex=config["cors_origin_regex"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health_check",
          description="Used to check whether the API and its connections to upstream systems are \
