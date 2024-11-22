@@ -4,3 +4,7 @@ fastapi
 hop-client
 httpx
 uvicorn[standard]
+aioboto3==12.1.0
+aiobotocore==2.8.0
+botocore==1.33.10
+boto3==1.33.10
