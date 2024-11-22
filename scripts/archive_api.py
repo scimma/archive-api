@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Sequence, Union
 from typing_extensions import Annotated
 from fastapi import FastAPI, Header, Path, Query, Request, status
 from fastapi.responses import Response, JSONResponse, StreamingResponse
@@ -209,6 +209,18 @@ async def stream_s3_response(result):
 	async for chunk in result['Body']:
 		yield chunk
 
+def has_permission(permission_set: Sequence[str], necessary_permission: str):
+	"""Check whether a set of permissions contains a given permission, directly or indirectly via an
+	'All' permission.
+	
+	Args:
+		permission_set: the set of permissions which exist
+		necessary_permission: the permission for which to check
+	
+	Returns: Whether a matching permission exists in the permission set
+	"""
+	return necessary_permission in permission_set or "All" in permission_set
+
 @app.get("/msg/{msg_id}",
          description="Retrieve a single stored message from the archive, by UUID. "
                      "Authentication via SCRAM is required to fetch non-public messages. ",
@@ -314,7 +326,7 @@ async def fetch_message(msg_id: Annotated[str, Path(description="The ID of messa
 	allowed_ops = resp.json()["allowed_operations"]
 	if not isinstance(allowed_ops, collections.abc.Sequence):
 		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if "Read" not in allowed_ops and "All" not in allowed_ops:
+	if not has_permission(allowed_ops, "Read"):
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	# If the user is authorized, fetch the message from S3 and stream it back
@@ -646,7 +658,7 @@ async def fetch_raw_message(msg_id: Annotated[str, Path(title="The ID of message
 	allowed_ops = resp.json()["allowed_operations"]
 	if not isinstance(allowed_ops, collections.abc.Sequence):
 		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if "Read" not in allowed_ops and "All" not in allowed_ops:
+	if not has_permission(allowed_ops, "Read"):
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
@@ -844,7 +856,7 @@ async def fetch_time_range(topic_name: Annotated[str,
 	allowed_ops = resp.json()["allowed_operations"]
 	if not isinstance(allowed_ops, collections.abc.Sequence):
 		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if "Read" not in allowed_ops and "All" not in allowed_ops:
+	if not has_permission(allowed_ops, "Read"):
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	# at this point we know the user is allowed to read the data, if there is any, so we must look for it
@@ -1036,8 +1048,7 @@ async def write_message(request: Request,
 	  or "publicly_readable" not in hop_json["topic"]["body"]:
 		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API")
 
-	if "Write" not in hop_json["ops"]["body"]["allowed_operations"] \
-	  and "All" not in hop_json["ops"]["body"]["allowed_operations"]:
+	if not has_permission(hop_json["ops"]["body"]["allowed_operations"], "Write"):
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 
 	message_is_public = hop_json["topic"]["body"]["publicly_readable"]
