@@ -314,7 +314,7 @@ async def fetch_message(msg_id: Annotated[str, Path(description="The ID of messa
 	allowed_ops = resp.json()["allowed_operations"]
 	if not isinstance(allowed_ops, collections.abc.Sequence):
 		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if not "Read" in allowed_ops:
+	if "Read" not in allowed_ops and "All" not in allowed_ops:
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	# If the user is authorized, fetch the message from S3 and stream it back
@@ -646,7 +646,7 @@ async def fetch_raw_message(msg_id: Annotated[str, Path(title="The ID of message
 	allowed_ops = resp.json()["allowed_operations"]
 	if not isinstance(allowed_ops, collections.abc.Sequence):
 		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if not "Read" in allowed_ops:
+	if "Read" not in allowed_ops and "All" not in allowed_ops:
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
@@ -844,7 +844,7 @@ async def fetch_time_range(topic_name: Annotated[str,
 	allowed_ops = resp.json()["allowed_operations"]
 	if not isinstance(allowed_ops, collections.abc.Sequence):
 		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if not "Read" in allowed_ops:
+	if "Read" not in allowed_ops and "All" not in allowed_ops:
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	# at this point we know the user is allowed to read the data, if there is any, so we must look for it
@@ -1036,7 +1036,8 @@ async def write_message(request: Request,
 	  or "publicly_readable" not in hop_json["topic"]["body"]:
 		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API")
 
-	if "Write" not in hop_json["ops"]["body"]["allowed_operations"]:
+	if "Write" not in hop_json["ops"]["body"]["allowed_operations"] \
+	  and "All" not in hop_json["ops"]["body"]["allowed_operations"]:
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 
 	message_is_public = hop_json["topic"]["body"]["publicly_readable"]
