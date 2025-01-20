@@ -1003,18 +1003,19 @@ async def write_message(request: Request,
 		return authentication_required();
 
 	topic_name = unquote(topic_name)
+	base_topic_name = effective_topic_name_for_access(topic_name)
 	path_root=urlparse(config['hop_auth_api_root']).path
 	print("Sending request to hopauth with authorization header:", authorization)
 	resp = await httpClient.post(config['hop_auth_api_root']+"/v1/multi",
 	                             json={
 	                               "ops":{
 	                                 "method":"get",
-	                                 "path":f"{path_root}/v1/current_credential/permissions/topic/{topic_name}",
+	                                 "path":f"{path_root}/v1/current_credential/permissions/topic/{base_topic_name}",
 	                                 "headers":{"Authorization": "Inherit"},
 	                               },
 	                               "topic":{
 	                                 "method":"get",
-	                                 "path":f"{path_root}/v1/topics/{topic_name}",
+	                                 "path":f"{path_root}/v1/topics/{base_topic_name}",
 	                                 "headers":{"Authorization": "Inherit"},
 	                               },
 	                             },
@@ -1025,6 +1026,7 @@ async def write_message(request: Request,
 		return Response(status_code=401, content=resp.content, 
 						headers={"www-authenticate": resp.headers["www-authenticate"]})
 	if resp.status_code != 200:
+		logging.error("hop_auth API error: {resp.status_code}")
 		return Response(status_code=500, content="Internal Error: hop_auth API request failed")
 	if "authentication-info" in resp.headers:
 		resp_headers["authentication-info"] = resp.headers["authentication-info"]
@@ -1037,16 +1039,30 @@ async def write_message(request: Request,
 	  or "status" not in hop_json["ops"] \
 	  or "topic" not in hop_json or not isinstance(hop_json["topic"], collections.abc.Mapping) \
 	  or "status" not in hop_json["topic"]:
-		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API")
+		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API", headers=resp_headers)
 	if hop_json["ops"]["status"]!=200 or hop_json["topic"]["status"]!=200:
-		return Response(status_code=500, content="Internal Error: hop_auth API sub-request failed")
+		if hop_json["ops"]["status"]>=400 and hop_json["ops"]["status"]<=499:
+			return Response(status_code=hop_json["ops"]["status"], 
+			                content="hop_auth API permissions sub-request failed "
+			                        f"({hop_json['ops']['status']}): {hop_json['ops'].get('body')}", 
+			                headers=resp_headers)
+		if hop_json["topic"]["status"]>=400 and hop_json["topic"]["status"]<=499:
+			return Response(status_code=hop_json["topic"]["status"], 
+			                content="hop_auth API topic sub-request failed "
+			                        f"({hop_json['topic']['status']}): {hop_json['topic'].get('body')}", 
+			                headers=resp_headers)
+		logging.error("Error from hop_auth API: \n"
+		              f"Permissions ({hop_json['ops']['status']}): {hop_json['ops'].get('body')}\n"
+		              f"Topic ({hop_json['topic']['status']}): {hop_json['topic'].get('body')}"
+		              )
+		return Response(status_code=500, content="Internal Error: hop_auth API sub-request failed", headers=resp_headers)
 
 	if "body" not in hop_json["ops"] or not isinstance(hop_json["ops"]["body"], collections.abc.Mapping) \
 	  or "allowed_operations" not in hop_json["ops"]["body"] \
 	  or not isinstance(hop_json["ops"]["body"]["allowed_operations"], collections.abc.Sequence) \
 	  or "body" not in hop_json["topic"] or not isinstance(hop_json["topic"]["body"], collections.abc.Mapping) \
 	  or "publicly_readable" not in hop_json["topic"]["body"]:
-		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API")
+		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API", headers=resp_headers)
 
 	if not has_permission(hop_json["ops"]["body"]["allowed_operations"], "Write"):
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
