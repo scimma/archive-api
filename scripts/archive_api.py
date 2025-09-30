@@ -11,6 +11,7 @@ import logging
 import os
 import struct
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -21,6 +22,7 @@ import bson
 import hop
 
 from archive import access_api, utility_api
+from archive.mview import MMView
 
 parser = argparse.ArgumentParser()
 utility_api.add_parser_options(parser)
@@ -934,9 +936,9 @@ def _is_bytes_like(obj):
              201: {
                  "description": "Message stored successfully.",
                  "content": {
-                     "text/plain": {
+                     "application/bson": {
                          "schema": {
-                             "type": "string"
+                             "type": "object"
                          }
                      }
                  }
@@ -1070,15 +1072,16 @@ async def write_message(request: Request,
 	message_is_public = hop_json["topic"]["body"]["publicly_readable"]
 	
 	# at this point we know the user is allowed to write, so we process the data that was sent
-
-	raw_data = await request.body()
-	logging.debug(f"Got a request with size {len(raw_data)}")
+	raw_data = MMView()
+	async for chunk in request.stream():
+		raw_data.append(chunk)
 	try:
 		data = bson.loads(raw_data)
 	except Exception as ex:
+		traceback.print_exception(ex)
 		logging.warning(str(ex))
 		return Response(status_code=400, content="Request must be valid BSON", headers=resp_headers)
-	logging.debug(f"Decoded request body: {data}")
+
 	allowed_data_keys = {"message", "headers", "key"}
 	for key in data.keys():
 		if key not in allowed_data_keys:
@@ -1112,11 +1115,17 @@ async def write_message(request: Request,
 			                headers=resp_headers)
 		key = data["key"]
 	metadata = hop.io.Metadata(topic_name, 0, 0, timestamp, key, headers, None)
-	stored, reason = await archiveClient.store_message(payload, metadata, public=message_is_public,
-	                                                   direct_upload=True)
-	
+	try:
+		stored, store_meta, reason = await archiveClient.store_message(payload, metadata,
+		                                                               public=message_is_public,
+		                                                               direct_upload=True)
+	except Exception as ex:
+		traceback.print_exception(ex)
+		return Response(status_code=500, content="Internal Error: Failed to store message",
+		                headers=resp_headers)
+
 	if stored:
-		return Response(status_code=201, headers=resp_headers)
+		return Response(status_code=201, content=bson.dumps(store_meta), headers=resp_headers)
 	else:
 		logging.warning(reason)
 		return Response(status_code=422, content=reason, headers=resp_headers)
