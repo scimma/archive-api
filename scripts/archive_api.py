@@ -11,7 +11,6 @@ import logging
 import os
 import struct
 import time
-import traceback
 import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -1077,9 +1076,8 @@ async def write_message(request: Request,
 		raw_data.append(chunk)
 	try:
 		data = bson.loads(raw_data)
-	except Exception as ex:
-		traceback.print_exception(ex)
-		logging.warning(str(ex))
+	except:
+		logging.exception("Failed to decode request body as BSON")
 		return Response(status_code=400, content="Request must be valid BSON", headers=resp_headers)
 
 	allowed_data_keys = {"message", "headers", "key"}
@@ -1119,8 +1117,8 @@ async def write_message(request: Request,
 		stored, store_meta, reason = await archiveClient.store_message(payload, metadata,
 		                                                               public=message_is_public,
 		                                                               direct_upload=True)
-	except Exception as ex:
-		traceback.print_exception(ex)
+	except:
+		logging.exception("Failed to store record to archive")
 		return Response(status_code=500, content="Internal Error: Failed to store message",
 		                headers=resp_headers)
 
