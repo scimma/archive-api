@@ -15,6 +15,7 @@ import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
 from urllib.parse import unquote, urlparse
+from typing import Optional
 
 import httpx
 import bson
@@ -175,6 +176,96 @@ messageRecordSchema = {
                           }
                       }
 
+messageOrMetaRecordSchema = {
+	"type": "object",
+	"properties": {
+		"message": {
+			"type": "string",
+			"format": "binary",
+			"description": "The raw mesage body. This is not included if the `meta` parameter is set.",
+		},
+		"metadata": {
+			"type": "object",
+			"description": "Kafka metadata for the message",
+			"properties": {
+				"headers": {
+					"type": "object",
+					"description": "Kafka message headers. This is not included if the `meta` parameter is set.",
+					"patternProperties": {
+						".*": {
+							"type": "string",
+							"format": "binary",
+						}
+					}
+				},
+				"key": {
+					"type": "string",
+					"format": "binary",
+					"description": "Kafka message key. This is not included if the `meta` parameter is set.",
+				},
+				"timestamp": {
+					"type": "number",
+					"description": "The time at which the message was sent to the Kafka broker.",
+				},
+				"topic": {
+					"type": "string",
+					"description": "The name of the Kafka topic to which the message was sent.",
+				},
+			},
+			"required": ["timestamp", "topic"]
+		},
+		"annotations": {
+			 "type": "object",
+			 "description": "Metadata added by the archive",
+			 "properties": {
+				"crc32": {
+					"type": "number",
+					"description": "The CRC32 of the message+metadata envelope",
+				},
+				"con_message_crc32": {
+					"type": "number",
+					"description": "The CRC32 of the message data",
+				},
+				"con_text_uuid": {
+					"type": "string",
+					"format": "uuid",
+					"description": "The message UUID as a string",
+				},
+				"public": {
+					"type": "boolean",
+					"description": "Whether the message is public",
+				},
+				"size": {
+					"type": "number",
+					"description": "The size of the message body in bytes",
+				},
+			 },
+			"required": ["crc32", "con_message_crc32", "con_text_uuid", "public", "size"]
+		},
+	},
+	"required": ["metadata", "annotations"]
+}
+
+messageListSchema = {
+	"type": "object",
+	"properties": {
+		"messages":{
+			"type": "array",
+			"description": "Message or metadata records",
+			"items": messageOrMetaRecordSchema,
+		},
+		"next":{
+			"type": "string",
+			"description": "Bookmark for the next page of results; omitted if there is no next page",
+		},
+		"prev":{
+			"type": "string",
+			"description": "Bookmark for the previous page of results; omitted if there is no previous page",
+		},
+	},
+	"required": ["messages"]
+}
+
 def effective_topic_name_for_access(topic_name: str):
 	"""
 	Compute the topic name which should be used for querying access control.
@@ -209,6 +300,26 @@ def authentication_required():
 async def stream_s3_response(result):
 	async for chunk in result['Body']:
 		yield chunk
+
+def transform_db_record(rec):
+	return {
+		"metadata":{
+			"topic": rec.topic,
+			"timestamp": rec.timestamp,
+			# not key, because it is unrelated to the key in the kafka metadata
+		},
+		"annotations":{
+			"con_text_uuid": rec.uuid,
+			"size": rec.size,
+			"crc32": rec.crc32,
+			"public": rec.public,
+			"con_message_crc32": rec.public,
+			"title": rec.title,
+			"sender": rec.sender,
+			"media_type": rec.media_type,
+			"file_name": rec.file_name,
+		},
+	}
 
 def has_permission(permission_set: Sequence[str], necessary_permission: str):
 	"""Check whether a set of permissions contains a given permission, directly or indirectly via an
@@ -303,6 +414,7 @@ async def fetch_message(msg_id: Annotated[str, Path(description="The ID of messa
 	
 	# Check whether the message is public; if so we can immediately return it to the user
 	if metadata.public:
+		# TODO: better error handling if get_object_lazily fails and returns None
 		return StreamingResponse(stream_s3_response(await archiveClient.get_object_lazily(metadata.key)),
 	                         headers=resp_headers)
 	
@@ -669,7 +781,8 @@ async def fetch_raw_message(msg_id: Annotated[str, Path(title="The ID of message
 	                         headers=resp_headers)
 
 
-async def stream_message_list(archiveClient, db_records, next_offset):
+async def stream_message_list(archiveClient, db_records, *, next_offset: Optional[int]=None,
+                              next_mark: Optional[str]=None, prev_mark: Optional[str]=None):
 	# Time for evil!
 	# We want to stream back all of the BSON blobs without having to hold all of them in memory.
 	# Luckily, BSON can be embedded in BSON, so we will make up a document on the fly, streaming
@@ -688,8 +801,24 @@ async def stream_message_list(archiveClient, db_records, next_offset):
 	# A document must start with a 32 bit size, and end with a NUL byte.
 	total_size = 5
 	# Each element in the document must have a one byte type, a NUL-terminated name, and its data.
-	# The top-level `next_offset` item has an 11 byte key, and 8 bytes of data
-	total_size += 1+11+1+8
+	if next_offset is not None:
+		# The top-level `next_offset` item has an 11 byte key, and 8 bytes of data
+		total_size += 1+11+1+8
+	else:
+		if next_mark is not None:
+			next_mark = next_mark.encode("utf-8")
+			# the bookmark has a 4 byte key and a string value
+			total_size += 1+4+1+4+len(next_mark)+1
+		else:
+			# the bookmark has a 4 byte key and a null value
+			total_size += 1+4+1
+		if prev_mark is not None:
+			prev_mark = prev_mark.encode("utf-8")
+			# the bookmark has a 4 byte key and a string value
+			total_size += 1+4+1+4+len(prev_mark)+1
+		else:
+			# the bookmark has a 4 byte key and a null value
+			total_size += 1+4+1
 	# The messages array has an 8 byte key, then a 'array' document for a value
 	total_size += 1+8+1
 	array_size = 5
@@ -705,9 +834,25 @@ async def stream_message_list(archiveClient, db_records, next_offset):
 	# message blob.
 	header = BytesIO()
 	header.write(struct.pack("<i", total_size)) # overall document size
-	header.write(b"\x12") # int64 type label
-	header.write(b"next_offset\x00") # e_name
-	header.write(struct.pack("<q", next_offset)) # value
+	if next_offset is not None:
+		header.write(b"\x12") # int64 type label
+		header.write(b"next_offset\x00") # e_name
+		header.write(struct.pack("<q", next_offset)) # value
+	else:
+		header.write(b"\x02" if next_mark is not None else b"\x0A") # string type or null type
+		header.write(b"next\x00") # e_name
+		if next_mark is not None:
+			header.write(struct.pack("<i", len(next_mark)+1)) # string length
+			header.write(next_mark)
+			header.write(b"\x00") # NUL terminator
+		
+		header.write(b"\x02" if prev_mark is not None else b"\x0A") # string type or null type
+		header.write(b"prev\x00") # e_name
+		if prev_mark is not None:
+			header.write(struct.pack("<i", len(prev_mark)+1)) # string length
+			header.write(prev_mark)
+			header.write(b"\x00") # NUL terminator
+		
 	header.write(b"\x04") # array type label
 	header.write(b"messages\x00") # e_name
 	header.write(struct.pack("<i", array_size)) # array document size
@@ -724,6 +869,10 @@ async def stream_message_list(archiveClient, db_records, next_offset):
 	while index < len(db_records):
 		record = db_records[index]
 		msg_result = await archiveClient.get_object_lazily(record.key)
+		if msg_result is None:
+			err=f"Failed to fetch message data for key {record.key}; unable to complete request"
+			logging.error(err)
+			raise KeyError(err)
 		async for chunk in msg_result['Body']:
 			yield chunk
 		index += 1
@@ -738,50 +887,24 @@ async def stream_message_list(archiveClient, db_records, next_offset):
 	
 
 @app.get("/topic/{topic_name}",
-         description="Retrieve messages which were published on a given topic during a specified time range. "
-                     "Time ranges are specified as Kafka times (milliseconds since the unix epoch). " #TODO: is this always UTC?
-                     "Results are returned in chunks, so users should expect to repeat requests to "
-                     "obtain all messages in a time range. "
-                     "A response with an empty list of messages indicates a lack of further messages "
-                     "(i.e. after the requested offset) in the specified range. "
-                     "Responses will contain messages in time-order. "
-                     "Authentication via SCRAM is required to fetch non-public messages.",
+         description="Fetch messages or metadata about messages which were published on a single topic. "
+                     "Time ranges are specified as Kafka times (milliseconds since the unix epoch). ",
          response_class=Response,
          responses={
              200: {
-                 "description": "A block of messages which were published during the requested period. "
-                                "Note that the format is BSON.",
+                "description": "Message data. Note that the format is BSON.",
                  "content": {
                      "application/bson": {
-                         "schema": {
-                             "type": "object",
-                             "properties": {
-                                 "next_offset": {
-                                     "type": "number",
-                                     "format": "integer",
-                                     "description": "This is the value which should be specified as "
-                                                    "the offset in a following request to fetch the "
-                                                    "next block of messages."
-                                 },
-                                 "messages": {
-                                     "type": "array",
-                                     "items": messageRecordSchema,
-                                 }
-                             }
-                         }
+                         "schema": messageListSchema
                      }
                  }
              },
              400: {
-                 "description": "Bad request. This may be caused by an an invalid time range or "
-                                "requesting a non-existent topic.",
+                 "description": "Bad request. This may be caused by an ill-formed request parameter.",
                  "content": {
                      "text/plain": {
                          "schema": {
-                             "type": "string",
-                             "examples": ["Invalid time range", 
-                                          "Invalid message count limit", 
-                                          "Invalid message offset"],
+                             "type": "string"
                          }
                      }
                  }
@@ -791,15 +914,13 @@ async def stream_message_list(archiveClient, db_records, next_offset):
                  "content": {
                      "text/plain": {
                          "schema": {
-                             "type": "string",
-                             "examples": ["Authentication required"],
+                             "type": "string"
                          }
                      }
                  }
              },
              403: {
-                 "description": "Not authorized. The authenticated user does not have access to the "
-                                "requested topic.",
+                 "description": "Not authorized. The authenticated user does not have access to read some requested data.",
                  "content": {
                      "text/plain": {
                          "schema": {
@@ -809,65 +930,93 @@ async def stream_message_list(archiveClient, db_records, next_offset):
                      }
                  }
              },
-         })
-async def fetch_time_range(topic_name: Annotated[str, 
-                           Path(description="The name of the topic from which to read")],
-                           start: Annotated[int, Query(description="Timestamp for start of time range")],
-                           end: Annotated[int, Query(description="Timestamp for end of time range")],
-                           limit: Annotated[int, Query(description="Maximum number of messages to return at a time. "
-                                                                   "If too large a value is specified, the server may replace it with its own limit.")] = 10,
-                           offset: Annotated[int, Query(description="Offset of first message to return")] = 0,
-                           authorization: Annotated[Union[str, None], Header(description="RFC 7804 SCRAM authentication")] = None,
-                           ):
+             500: {
+                 "description": "Internal error.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+            })
+async def fetch_from_single_topic(topic_name: Annotated[str, 
+                                  Path(description="The name of the topic from which to read")],
+                                  start_time: Annotated[Optional[int], Query(description="Timestamp for start of time range")] = None,
+                                  end_time: Annotated[Optional[int], Query(description="Timestamp for end of time range")] = None,
+                                  page: Annotated[Optional[str], Query(description="A bookmark string describing the page of results to fetch, as returned by a previous query. If not specified, the first page will be fetched.")]=None,
+                                  limit: Annotated[Optional[int], Query(description="The maximum number of results to fetch. Any results of the query beyond this can be fetched in subsequent queries by specifying bookmark for the subsequent page(s). This is capped at 64 when fetching full messages, and 1024 when fetching only message metadata.")]=64,
+                                  asc: Annotated[bool, Query(description="Results in ascending time order")]=True,
+                                  meta: Annotated[bool, Query(description="Return only metadata without message payloads, instead of the full messages.")]=False,
+                                  authorization: Annotated[Union[str, None], Header(description="Any authentication accesed by scimma-admin, including RFC 7804 SCRAM authentication and REST tokens. If not specified, only public results will be returned.")] = None,
+                                  ):
 	resp_headers={}
-	if end<start or start<0:
+	if start_time is not None and end_time is not None and end_time < start_time:
 		return Response(status_code=400, content="Invalid time range")
 	
 	if limit <= 0:
 		return Response(status_code=400, content="Invalid message count limit")
-	if limit > 16:
-		limit = 16
-	
-	if offset < 0:
-		return Response(status_code=400, content="Invalid message offset")
+	max_limit = 1024 if meta else 64
+	if limit > max_limit:
+		limit = max_limit
 
-	# Query hopauth to find out if the user is allowed to read this topic.
-	# This requires authenticating the user to hopauth.
+	
 	if authorization is None:
-		return authentication_required();
-	
-	auth_query_url = f"{config['hop_auth_api_root']}/v1/current_credential/permissions/topic/" \
-		f"{effective_topic_name_for_access(topic_name)}"
-	
-	resp = await httpClient.get(auth_query_url, headers={"Authorization": authorization})
-	if resp.status_code == 401 and "www-authenticate" in resp.headers:
-		return Response(status_code=401, content=resp.content, 
-						headers={"www-authenticate": resp.headers["www-authenticate"]})
-	if resp.status_code != 200:
-		if resp.status_code >= 200 and resp.status_code <=499:
-			# It would be nice to be more informative here, but Django makes it awkward for
-			# the hopauth code to send things other than error 400 when anything goes wrong.
-			return Response(status_code=400, content="Bad Request")
-		return Response(status_code=500, content="Internal Error")
-	if "authentication-info" in resp.headers:
-		resp_headers["authentication-info"] = resp.headers["authentication-info"]
-	# After this point it is important to always return a response with resp_headers
-	# as the client may be expecting the authentication-info!
+		# if no authentication is supplied, assume public-only access
+		topics_full = []
+		topics_public = [topic_name]
+	else:
+		# Query hopauth to find out if the user is allowed to read this topic.
+		# This requires authenticating the user to hopauth.
+		auth_query_url = f"{config['hop_auth_api_root']}/v1/current_credential/permissions/topic/" \
+			f"{effective_topic_name_for_access(topic_name)}"
 		
-	allowed_ops = resp.json()["allowed_operations"]
-	if not isinstance(allowed_ops, collections.abc.Sequence):
+		resp = await httpClient.get(auth_query_url, headers={"Authorization": authorization})
+		if resp.status_code == 401 and "www-authenticate" in resp.headers:
+			return Response(status_code=401, content=resp.content, 
+							headers={"www-authenticate": resp.headers["www-authenticate"]})
+		if resp.status_code != 200:
+			if resp.status_code >= 200 and resp.status_code <=499:
+				# It would be nice to be more informative here, but Django makes it awkward for
+				# the hopauth code to send things other than error 400 when anything goes wrong.
+				return Response(status_code=400, content="Bad Request")
+			return Response(status_code=500, content="Internal Error")
+		if "authentication-info" in resp.headers:
+			resp_headers["authentication-info"] = resp.headers["authentication-info"]
+		# After this point it is important to always return a response with resp_headers
+		# as the client may be expecting the authentication-info!
+			
+		allowed_ops = resp.json()["allowed_operations"]
+		if not isinstance(allowed_ops, collections.abc.Sequence):
+			return Response(status_code=500, content="Internal Error", headers=resp_headers)
+		if not has_permission(allowed_ops, "Read"):
+			topics_full = [topic_name]
+			topics_public = []
+		else:
+			topics_full = []
+			topics_public = [topic_name]
+	
+	try:
+		mrecords, nmark, pmark = await archiveClient.get_message_records(bookmark=page, 
+		                                                                 page_size=limit,
+		                                                                 ascending=asc, 
+		                                                                 topics_public=topics_public,
+		                                                                 topics_full=topics_full,
+		                                                                 start_time=start_time,
+		                                                                 end_time=end_time)
+	except Exception as err:
+		logging.error(f"Error fetching message records from database: {err}")
+		# Note: error might be a bad request, e.g. due to invalid bookmark data
 		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if not has_permission(allowed_ops, "Read"):
-		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
-	
-	# at this point we know the user is allowed to read the data, if there is any, so we must look for it
-	# TODO: sanitize topic_name against SQL-injection?
-	#       If we've gotten here it is a topic which actually exists, which is something
-	logging.debug(f"Query time range is [{start},{end}) on topic {topic_name}")
-	
-	db_records = await archiveClient.get_metadata_for_time_range(topic_name, start, end, limit, offset)
 
-	return StreamingResponse(stream_message_list(archiveClient, db_records, offset+len(db_records)),
+	if meta:
+		# if the client wants only the metadata, we can just return it directly
+		return Response(content=bson.dumps({"messages":[transform_db_record(m) for m in mrecords], 
+											"next":nmark, "prev":pmark}),
+						headers=resp_headers)
+	
+	return StreamingResponse(stream_message_list(archiveClient, mrecords, next_mark=nmark, prev_mark=pmark),
 	                         headers=resp_headers)
 
 def _is_bytes_like(obj):
@@ -1006,7 +1155,6 @@ async def write_message(request: Request,
 	topic_name = unquote(topic_name)
 	base_topic_name = effective_topic_name_for_access(topic_name)
 	path_root=urlparse(config['hop_auth_api_root']).path
-	print("Sending request to hopauth with authorization header:", authorization)
 	resp = await httpClient.post(config['hop_auth_api_root']+"/v1/multi",
 	                             json={
 	                               "ops":{
@@ -1127,3 +1275,349 @@ async def write_message(request: Request,
 	else:
 		logging.warning(reason)
 		return Response(status_code=422, content=reason, headers=resp_headers)
+
+
+#===================================================================================================
+
+
+@app.get("/topics",
+         description="Get the list of topics which can be accessed with the current authentication",
+         response_class=Response,
+         responses={
+             200: {
+                "description": "Message data. Note that the format is BSON.",
+                 "content": {
+                     "application/bson": {
+                         "schema": {
+                             "type": "object",
+                             "properties": {
+                                 "topics": {
+                                     "type": "array",
+                                     "description": "The names of topics which are accessible",
+                                     "items": {
+                                         "type": "string"
+                                     }
+                                 },
+                             },
+                             "required": ["topics"]
+                         }
+                     }
+                 }
+             },
+             401: {
+                 "description": "Authentication required.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+             403: {
+                 "description": "Not authorized. The authenticated user does not have access to read some requested data.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string",
+                             "examples": ["Operation not permitted"],
+                         }
+                     }
+                 }
+             },
+             500: {
+                 "description": "Internal error.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+         })
+async def get_available_topics(request: Request,
+                               authorization: Annotated[Optional[str], Header(description="Any authentication accesed by scimma-admin, including RFC 7804 SCRAM authentication and REST tokens. If not specified, only public results will be returned.")] = None):
+	resp_headers={}
+	if authorization is None:
+		# assume that if no authorization was sent, the request is about public data only
+		topic_perms = []
+	else:
+		hopauth_query_url = f"{config['hop_auth_api_root']}/v1/current_user/available_permissions"
+		resp = await httpClient.get(hopauth_query_url, headers={"Authorization": authorization})
+		if resp.status_code == 401 and "www-authenticate" in resp.headers:
+			return Response(status_code=401, content=resp.content, 
+			                headers={"www-authenticate": resp.headers["www-authenticate"]})
+		if resp.status_code != 200:
+			logging.error(f"Error querying {hopauth_query_url}: {resp.content}")
+			return Response(status_code=500, content="Internal Error")
+		if "authentication-info" in resp.headers:
+			resp_headers["authentication-info"] = resp.headers["authentication-info"]
+		topic_perms = resp.json()
+	
+	topics = set(await archiveClient.get_topics_with_public_messages())
+	for perm in topic_perms:
+		if perm["operation"] == "Read" or perm["operation"] == "All":
+			topics.add(perm["topic"])
+	return Response(content=bson.dumps({"topics":list(topics)}), headers=resp_headers)
+
+async def authorize_multi_topic_access(authorization, resp_headers, topics):
+	"""
+	Params:
+		resp_headers: The headers which must be included with any subsequent response.
+		              This object may be modified/updated.
+	Returns a tuple of the response which _must_ be immediately sent back if not None,
+	           the list of public topics, and the list of full/private access topics.
+	"""
+	topics_public = None
+	topics_full = None
+	if authorization is not None:
+		# treat the user as (potentially) logged-in, so all topics to which the user has full access
+		# should be treated as such, while all others will have usual public-only access level
+		hopauth_query_url = f"{config['hop_auth_api_root']}/v1/current_user/available_permissions"
+		resp = await httpClient.get(hopauth_query_url, headers={"Authorization": authorization})
+		if resp.status_code == 401 and "www-authenticate" in resp.headers:
+			return (Response(status_code=401, content=resp.content, 
+			                 headers={"www-authenticate": resp.headers["www-authenticate"]}),
+			        None, None)
+		if resp.status_code != 200:
+			logging.error(f"Error querying {hopauth_query_url}: {resp.content}")
+			return (Response(status_code=500, content="Internal Error"), None, None)
+		if "authentication-info" in resp.headers:
+			resp_headers["authentication-info"] = resp.headers["authentication-info"]
+		topic_perms = resp.json()
+		
+		allowed_topics_full = set()
+		for perm in topic_perms:
+			if perm["operation"] == "Read" or perm["operation"] == "All":
+				allowed_topics_full.add(perm["topic"])
+		
+		if len(topics) == 0:
+			# if the user made no topic selection, select _all_ accessible topics
+			topics_full = list(allowed_topics_full)
+			topics_with_public = set(await archiveClient.get_topics_with_public_messages())
+			topics_public = list(topics_with_public-allowed_topics_full)
+		else:
+			# otherwise, apply the selection requested by the user
+			topics_full = [t for t in topics if t in allowed_topics_full]
+			topics_public = [t for t in topics if t not in allowed_topics_full]
+		if len(topics_full) == 0:
+			topics_full = None
+		if len(topics_public) == 0:
+			topics_public = None
+	else:
+		# with no authN data, the user cannot be logged in, so all access is necessarily at the
+		# public-only level
+		if len(topics) != 0:
+			topics_public = topics
+		# the database layer will automatically assume public data on any topic if no topics are
+		# specified
+	return (None, topics_public, topics_full)
+
+@app.get("/messages",
+         description="Fetch messages or metadata about messages.",
+         response_class=Response,
+         responses={
+             200: {
+                "description": "Message data. Note that the format is BSON.",
+                 "content": {
+                     "application/bson": {
+                         "schema": messageListSchema
+                     }
+                 }
+             },
+             400: {
+                 "description": "Bad request. This may be caused by an ill-formed request parameter.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+             401: {
+                 "description": "Authentication required.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+             403: {
+                 "description": "Not authorized. The authenticated user does not have access to read some requested data.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string",
+                             "examples": ["Operation not permitted"],
+                         }
+                     }
+                 }
+             },
+             500: {
+                 "description": "Internal error.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+            })
+async def get_messages(request: Request,
+                       topic: Annotated[list[str], Query(description="The topic(s) from which to count messages. If not specified, the count will be across all accessible topics. Note that this parameter can be specified repeatedly to select multiple topics.")]=[],
+                       start_time: Annotated[Optional[int], Query(description="Timestamp for start of time range. Kafka times are represented as milliseconds since the unix epoch. Leave unspecified for no constraint.")]=None,
+                       end_time: Annotated[Optional[int], Query(description="Timestamp for end of time range. Kafka times are represented as milliseconds since the unix epoch. Leave unspecified for no constraint.")]=None,
+                       search_query: Annotated[Optional[str], Query(description="If specified, a general text-search query to select messages")]=None,
+                       page: Annotated[Optional[str], Query(description="A bookmark string describing the page of results to fetch, as returned by a previous query. If not specified, the first page will be fetched.")]=None,
+                       limit: Annotated[Optional[int], Query(description="The maximum number of results to fetch. Any results of the query beyond this can be fetched in subsequent queries by specifying bookmark for the subsequent page(s). This is capped at 64 when fetching full messages, and 1024 when fetching only message metadata.")]=64,
+                       asc: Annotated[bool, Query(description="Results in ascending time order")]=True,
+                       meta: Annotated[bool, Query(description="Return only metadata without message payloads, instead of the full messages.")]=False,
+                       authorization: Annotated[Optional[str], Header(description="Any authentication accesed by scimma-admin, including RFC 7804 SCRAM authentication and REST tokens. If not specified, only public results will be returned.")] = None):
+	resp_headers={}
+	request_start=time.time()
+	
+	max_limit = 1024 if meta else 64
+	if limit > max_limit:
+		limit = max_limit
+	
+	required_resp, topics_public, topics_full = await authorize_multi_topic_access(authorization,
+	                                                                               resp_headers,
+	                                                                               topic)
+	if required_resp is not None:
+		return required_resp
+	
+	try:
+		if search_query is None:
+			mrecords, nmark, pmark = await archiveClient.get_message_records(bookmark=page, 
+			                                                                 page_size=limit,
+			                                                                 ascending=asc, 
+			                                                                 topics_public=topics_public,
+			                                                                 topics_full=topics_full,
+			                                                                 start_time=start_time,
+			                                                                 end_time=end_time)
+		else:
+			mrecords, nmark, pmark = await archiveClient.search_message_text(search_query,
+			                                                                 bookmark=page, 
+			                                                                 page_size=limit,
+			                                                                 ascending=asc, 
+			                                                                 topics_public=topics_public,
+			                                                                 topics_full=topics_full,
+			                                                                 start_time=start_time,
+			                                                                 end_time=end_time)
+	except Exception as err:
+		logging.error(f"Error fetching message records from database: {err}")
+		# Note: error might be a bad request, e.g. due to invalid bookmark data
+		return Response(status_code=500, content="Internal Error", headers=resp_headers)
+
+	request_end=time.time()
+	print(f"Request took {request_end-request_start} seconds")
+	if meta:
+		# if the client wants only the metadata, we can just return it directly
+		return Response(content=bson.dumps({"messages":[transform_db_record(m) for m in mrecords], 
+		                                    "next":nmark, "prev":pmark}),
+		                headers=resp_headers)
+	
+	return StreamingResponse(stream_message_list(archiveClient, mrecords, next_mark=nmark, prev_mark=pmark),
+	                         headers=resp_headers)
+
+messageCountSchema = {
+	"type": "object",
+	"properties": {
+		"count": {
+			"type": "integer",
+			"description": "The number of matching messages"
+		},
+	},
+}
+
+@app.get("/messages/count",
+         description="Get a count of messages matching particular criteria",
+         response_class=Response,
+         responses={
+             200: {
+                "description": "The count of messages. Note that the format is BSON.",
+                 "content": {
+                     "application/bson": {
+                         "schema": messageCountSchema
+                     }
+                 }
+             },
+             400: {
+                 "description": "Bad request. This may be caused by an ill-formed request parameter.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+             401: {
+                 "description": "Authentication required.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+             403: {
+                 "description": "Not authorized. The authenticated user does not have access to read some requested data.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string",
+                             "examples": ["Operation not permitted"],
+                         }
+                     }
+                 }
+             },
+             500: {
+                 "description": "Internal error.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string"
+                         }
+                     }
+                 }
+             },
+         }
+         )
+async def count_messages(request: Request,
+                         topic: Annotated[list[str], Query(description="The topic(s) from which to count messages. If not specified, the count will be across all accessible topics. Note that this parameter can be specified repeatedly to select multiple topics.")]=[],
+                         start_time: Annotated[Optional[int], Query(description="Timestamp for start of time range. Kafka times are represented as milliseconds since the unix epoch. Leave unspecified for no constraint.")]=None,
+                         end_time: Annotated[Optional[int], Query(description="Timestamp for end of time range. Kafka times are represented as milliseconds since the unix epoch. Leave unspecified for no constraint.")]=None,
+                         search_query: Annotated[Optional[str], Query(description="If specified, a general text-search query to select messages")]=None,
+                         authorization: Annotated[Optional[str], Header(description="Any authentication accesed by scimma-admin, including RFC 7804 SCRAM authentication and REST tokens. If not specified, only public results will be returned.")] = None):
+	resp_headers={}
+	required_resp, topics_public, topics_full = await authorize_multi_topic_access(authorization,
+	                                                                               resp_headers,
+	                                                                               topic)
+	if required_resp is not None:
+		return required_resp
+	
+	try:
+		if search_query is None:
+			n = await archiveClient.count_message_records(topics_public=topics_public,
+			                                              topics_full=topics_full,
+			                                              start_time=start_time,
+			                                              end_time=end_time)
+		else:
+			n = await archiveClient.count_text_search_results(search_query,
+			                                                  topics_public=topics_public,
+			                                                  topics_full=topics_full,
+			                                                  start_time=start_time,
+			                                                  end_time=end_time)
+	except Exception as err:
+		logging.error(f"Error counting message records in database: {err}")
+		return Response(status_code=500, content="Internal Error", headers=resp_headers)
+	
+	resp_headers["content-type"] = "application/bson"
+	return Response(content=bson.dumps({"count":n}), headers=resp_headers)
