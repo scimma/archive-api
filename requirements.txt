@@ -1,4 +1,4 @@
-archive-core @ git+https://github.com/scimma/archive-core@v1.2.0
+archive-core @ git+https://github.com/scimma/archive-core@v1.2.1
 fastapi
 hop-client
 httpx
