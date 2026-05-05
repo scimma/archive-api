@@ -114,7 +114,7 @@ async def health_check():
 		store_ok = False
 	try:
 		# only the status of the response matters
-		resp = await httpClient.get(f"{config['hop_auth_api_root']}/version")
+		resp = await httpClient.get(f"{config['hopauth_api_url']}/version")
 		hop_auth_ok = resp.status_code == 200
 	except:
 		hop_auth_ok = False
@@ -424,9 +424,9 @@ async def fetch_message(request: Request,
 	if authorization is None:
 		return authentication_required();
 	
-	path_root=urlparse(config['hop_auth_api_root']).path
+	path_root=urlparse(config['hopauth_api_url']).path
 	topic_name = effective_topic_name_for_access(metadata.topic)
-	resp = await httpClient.post(config['hop_auth_api_root']+"/v1/multi",
+	resp = await httpClient.post(config['hopauth_api_url']+"/v1/multi",
 							 json={
 							   "ops":{
 								 "method":"get",
@@ -445,7 +445,10 @@ async def fetch_message(request: Request,
 	if resp.status_code == 401 and "www-authenticate" in resp.headers:
 		return Response(status_code=401, content=resp.content, 
 						headers={"www-authenticate": resp.headers["www-authenticate"]})
+	if resp.status_code == 403:
+		return Response(status_code=403, content="Forbidden")
 	if resp.status_code != 200:
+		logging.info(f"FETCH_MESSAGE request with auth data {authorization} from {request.client.host} failed with status {resp.status_code} and body {resp.text}")
 		return Response(status_code=500, content="Internal Error")
 	if "authentication-info" in resp.headers:
 		resp_headers["authentication-info"] = resp.headers["authentication-info"]
@@ -780,9 +783,9 @@ async def fetch_raw_message(request: Request,
 	if authorization is None:
 		return authentication_required();
 	
-	path_root=urlparse(config['hop_auth_api_root']).path
+	path_root=urlparse(config['hopauth_api_url']).path
 	topic_name = effective_topic_name_for_access(metadata.topic)
-	resp = await httpClient.post(config['hop_auth_api_root']+"/v1/multi",
+	resp = await httpClient.post(config['hopauth_api_url']+"/v1/multi",
 							 json={
 							   "ops":{
 								 "method":"get",
@@ -801,6 +804,8 @@ async def fetch_raw_message(request: Request,
 	if resp.status_code == 401 and "www-authenticate" in resp.headers:
 		return Response(status_code=401, content=resp.content, 
 						headers={"www-authenticate": resp.headers["www-authenticate"]})
+	if resp.status_code == 403:
+		return Response(status_code=403, content="Forbidden")
 	if resp.status_code != 200:
 		return Response(status_code=500, content="Internal Error")
 	if "authentication-info" in resp.headers:
@@ -1038,6 +1043,8 @@ async def fetch_from_single_topic(request: Request,
 		if resp.status_code == 401 and "www-authenticate" in resp.headers:
 			return Response(status_code=401, content=resp.content, 
 							headers={"www-authenticate": resp.headers["www-authenticate"]})
+		if resp.status_code == 403:
+			return Response(status_code=403, content="Forbidden")
 		if resp.status_code != 200:
 			if resp.status_code >= 200 and resp.status_code <=499:
 				# It would be nice to be more informative here, but Django makes it awkward for
@@ -1249,6 +1256,8 @@ async def write_message(request: Request,
 	if resp.status_code == 401 and "www-authenticate" in resp.headers:
 		return Response(status_code=401, content=resp.content, 
 						headers={"www-authenticate": resp.headers["www-authenticate"]})
+	if resp.status_code == 403:
+		return Response(status_code=403, content="Forbidden")
 	if resp.status_code != 200:
 		logging.info(f"WRITE_MESSAGE request by {user_id} from {request.client.host} to topic {topic_name}")
 		logging.error("hop_auth API error: {resp.status_code}")
@@ -1449,6 +1458,8 @@ async def get_available_topics(request: Request,
 		if resp.status_code == 401 and "www-authenticate" in resp.headers:
 			return Response(status_code=401, content=resp.content, 
 			                headers={"www-authenticate": resp.headers["www-authenticate"]})
+		if resp.status_code == 403:
+			return Response(status_code=403, content="Forbidden")
 		if resp.status_code != 200:
 			logging.error(f"Error querying {config['hopauth_api_url']}: {resp.content.decode('utf-8')}")
 			return Response(status_code=500, content="Internal Error")
@@ -1503,6 +1514,8 @@ async def authorize_multi_topic_access(authorization, resp_headers, topics) -> T
 			return (Response(status_code=401, content=resp.content, 
 			                 headers={"www-authenticate": resp.headers["www-authenticate"]}),
 			        user_identifier, topics_public, topics_full)
+		if resp.status_code == 403:
+			return Response(status_code=403, content="Forbidden")
 		if resp.status_code != 200:
 			logging.error(f"Error querying {config['hopauth_api_url']}: {resp.content.decode('utf-8')}")
 			return (Response(status_code=500, content="Internal Error"), user_identifier, topics_public, topics_full)
@@ -1872,6 +1885,8 @@ async def retract_message(request: Request,
 	if resp.status_code == 401 and "www-authenticate" in resp.headers:
 		return Response(status_code=401, content=resp.content, 
 						headers={"www-authenticate": resp.headers["www-authenticate"]})
+	if resp.status_code == 403:
+		return Response(status_code=403, content="Forbidden")
 	if resp.status_code != 200:
 		return Response(status_code=500, content="Internal Error")
 	if "authentication-info" in resp.headers:
