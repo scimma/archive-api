@@ -1249,6 +1249,11 @@ async def write_message(request: Request,
 	                                 "path":f"{path_root}/v1/current_user",
 	                                 "headers":{"Authorization": "Inherit"},
 	                               },
+	                               "cred":{
+	                                 "method":"get",
+	                                 "path":f"{path_root}/v1/current_credential",
+	                                 "headers":{"Authorization": "Inherit"},
+	                               },
 	                             },
 	                             headers={"Authorization": authorization}
 	                             )
@@ -1274,7 +1279,9 @@ async def write_message(request: Request,
 	  or "topic" not in hop_json or not isinstance(hop_json["topic"], collections.abc.Mapping) \
 	  or "status" not in hop_json["topic"] \
 	  or "whoami" not in hop_json or not isinstance(hop_json["whoami"], collections.abc.Mapping) \
-	  or "status" not in hop_json["whoami"]:
+	  or "status" not in hop_json["whoami"] \
+	  or "cred" not in hop_json or not isinstance(hop_json["cred"], collections.abc.Mapping) \
+	  or "status" not in hop_json["cred"]:
 		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API", headers=resp_headers)
 	
 	if hop_json["whoami"]["status"]==200 and "body" in hop_json["whoami"] \
@@ -1334,6 +1341,7 @@ async def write_message(request: Request,
 		return Response(status_code=400, content=f"Missing message key in request body",
 		                headers=resp_headers)
 	payload = data["message"]
+	has_sender = False
 	if "headers" in data:
 		headers = data["headers"]
 		if isinstance(headers, collections.abc.Mapping):
@@ -1344,8 +1352,15 @@ async def write_message(request: Request,
 				return Response(status_code=400,
 				                content=f"Header with key {key} is not binary data",
 				                headers=resp_headers)
+			if key == "_sender":
+				has_sender = True
 	else:
 		headers = []
+	if not has_sender:
+		cred_name = hop_json["cred"].get("body",{}).get("username", None)
+		if cred_name:
+			headers.append(("_sender", cred_name.encode("utf-8")))
+			has_sender = True
 	# TODO: is this always correct in terms of timezone, precision, etc?
 	# Convert ns to milliseconds
 	timestamp = int(time.time_ns()/1000000+0.5)
@@ -1878,6 +1893,11 @@ async def retract_message(request: Request,
 								 "path":f"{path_root}/v1/current_user",
 								 "headers":{"Authorization": "Inherit"},
 							   },
+							   "cred":{
+								 "method":"get",
+								 "path":f"{path_root}/v1/current_credential",
+								 "headers":{"Authorization": "Inherit"},
+							   },
 							 },
 							 headers={"Authorization": authorization}
 							 )
@@ -1899,7 +1919,8 @@ async def retract_message(request: Request,
 		  and "username" in hop_json["whoami"]["body"] and "email" in hop_json["whoami"]["body"]:
 			user_id = f"user {hop_json['whoami']['body']['username']} ({hop_json['whoami']['body']['email']})"
 	
-	logging.info(f"RETRACT_MESSAGE request by {user_id} from {request.client.host}")
+	logging.info(f"RETRACT_MESSAGE request by {user_id} from {request.client.host}: "
+	             f"Message ID {msg_id}, retracted={retracted}")
 	
 	# figure out which group owns the topic
 	if hop_json["topic"]["status"]==200 and "body" in hop_json["topic"] \
@@ -1925,7 +1946,18 @@ async def retract_message(request: Request,
 		    break
 	
 	if not is_owner:
-		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
+		# The requesting user is not an owner of the group, but if we can identify them as being
+		# the same user who sent the message, we will still allow the operation. This requires the
+		# message having been tagged with a sender when it was archived. The sender could have put
+		# anything in that header, not matching their own credential, but we will consider it not
+		# our problem if having done so leads to that user not being recognized now (or granting
+		# control to some other user now).
+		if hop_json["cred"]["status"]==200 and "body" in hop_json["cred"] and \
+		  "username" in hop_json["cred"]["body"] and \
+		  hop_json["cred"]["body"]["username"] == metadata.sender:
+			is_owner = True
+		else:
+			return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	await archiveClient.mark_message_retracted(msg_id=msg_id, retracted=retracted)
 	return Response(status_code=200, content=bson.dumps({}), headers=resp_headers)
