@@ -1961,3 +1961,174 @@ async def retract_message(request: Request,
 	
 	await archiveClient.mark_message_retracted(msg_id=msg_id, retracted=retracted)
 	return Response(status_code=200, content=bson.dumps({}), headers=resp_headers)
+
+
+async def _hopauth_multi(authorization: str, ops_path: Optional[str] = None):
+    """
+    Perform a SCRAM-authenticated request to hopauth's /v1/multi endpoint,
+    always including a 'whoami' sub-request, and optionally a permission
+    check ('ops') sub-request for a specific path alongside it. This mirrors
+    fetch_message's inline handling exactly
+
+    Returns a 3-tuple: (relay_response, hop_json, resp_headers)
+      - If relay_response is not None, it must be returned to the original
+        caller immediately, as-is - the handshake is incomplete and this
+        gives the client what it needs to retry. hop_json and resp_headers
+        are None in this case.
+      - Otherwise, relay_response is None and hop_json / resp_headers hold
+        the parsed, successful result.
+    """
+    path_root = urlparse(config['hopauth_api_url']).path
+    body = {
+        "whoami": {
+            "method": "get",
+            "path": f"{path_root}/v1/current_user",
+            "headers": {"Authorization": "Inherit"},
+        },
+    }
+    if ops_path:
+        body["ops"] = {
+            "method": "get",
+            "path": ops_path,
+            "headers": {"Authorization": "Inherit"},
+        }
+
+    resp = await httpClient.post(
+        config['hopauth_api_url'] + "/v1/multi",
+        json=body,
+        headers={"Authorization": authorization},
+    )
+
+    if resp.status_code == 401 and "www-authenticate" in resp.headers:
+        return Response(status_code=401, content=resp.content,
+                         headers={"www-authenticate": resp.headers["www-authenticate"]}), None, None
+    if resp.status_code == 403:
+        return Response(status_code=403, content="Forbidden"), None, None
+    if resp.status_code != 200:
+        logging.error(f"_hopauth_multi: unexpected status {resp.status_code} body={resp.text}")
+        return Response(status_code=500, content="Internal Error"), None, None
+
+    resp_headers = {}
+    if "authentication-info" in resp.headers:
+        resp_headers["authentication-info"] = resp.headers["authentication-info"]
+
+    return None, resp.json(), resp_headers
+
+
+@app.get("/doi/check")
+async def check_dois(
+    request: Request,
+    message_uuids: Annotated[List[str], Query(alias="uuid", description="One or more message UUIDs to check")],
+    authorization: Annotated[Union[str, None], Header(description="RFC 7804 SCRAM authentication")] = None,
+):
+    if authorization is None:
+        return authentication_required()
+
+    candidate_uuids = []
+    for u in message_uuids:
+        try:
+            candidate_uuids.append(str(uuid.UUID(u)))
+        except ValueError:
+            continue
+    if not candidate_uuids:
+        return Response(status_code=400, content="No valid message UUIDs supplied")
+
+    permitted_uuids = []
+    topic_permission_cache: dict[str, bool] = {}
+    resp_headers: dict[str, str] = {}
+    path_root = urlparse(config['hopauth_api_url']).path
+
+    for message_uuid in candidate_uuids:
+        metadata = await archiveClient.get_metadata(message_uuid)
+        if metadata is None:
+            continue
+        topic = metadata.topic
+        if topic not in topic_permission_cache:
+            base_topic_name = effective_topic_name_for_access(topic)
+            relay, hop_json, extra_headers = await _hopauth_multi(
+                authorization,
+                ops_path=f"{path_root}/v1/current_credential/permissions/topic/{base_topic_name}",
+            )
+            if relay is not None:
+                return relay
+            resp_headers.update(extra_headers or {})
+            allowed_ops = hop_json.get("ops", {}).get("body", {}).get("allowed_operations", [])
+            topic_permission_cache[topic] = (
+                isinstance(allowed_ops, collections.abc.Sequence) and has_permission(allowed_ops, "Read")
+            )
+        if topic_permission_cache[topic]:
+            permitted_uuids.append(message_uuid)
+
+    if not permitted_uuids:
+        return JSONResponse(content={"conflicts": []}, headers=resp_headers)
+
+    # find_dois_for_messages already returns EVERY message belonging to any
+    # DOI that overlaps at all with our candidate set - not just the
+    # overlapping members - so total size and matched subset can both be
+    # computed from this single result set.
+    rows = await archiveClient.find_dois_for_messages(permitted_uuids)
+
+    by_doi: dict[int, dict] = {}
+    for row in rows:
+        doi_id = row.id
+        if doi_id not in by_doi:
+            by_doi[doi_id] = {
+                "doi": row.doi,
+                "record_url": row.record_url,
+                "title": row.title,
+                "total_message_count": 0,
+                "matched_uuids": set(),
+            }
+        by_doi[doi_id]["total_message_count"] += 1
+        if str(row.message_uuid) in permitted_uuids:
+            by_doi[doi_id]["matched_uuids"].add(str(row.message_uuid))
+
+    conflicts = [
+        {
+            "doi": entry["doi"],
+            "record_url": entry["record_url"],
+            "title": entry["title"],
+            "total_message_count": entry["total_message_count"],
+            "matched_count": len(entry["matched_uuids"]),
+            "matched_uuids": sorted(entry["matched_uuids"]),
+        }
+        for entry in by_doi.values()
+        if entry["matched_uuids"]  # only report DOIs that actually overlap a permitted uuid
+    ]
+
+    return JSONResponse(content={"conflicts": conflicts}, headers=resp_headers)
+
+
+@app.post("/doi/")
+async def record_doi(
+    request: Request,
+    authorization: Annotated[Union[str, None], Header(description="RFC 7804 SCRAM authentication")] = None,
+):
+    if authorization is None:
+        return authentication_required()
+
+    relay, hop_json, resp_headers = await _hopauth_multi(authorization)
+    if relay is not None:
+        return relay
+
+    whoami = hop_json.get("whoami", {})
+    if whoami.get("status") != 200 or "username" not in whoami.get("body", {}):
+        return Response(status_code=403, content="Forbidden", headers=resp_headers)
+    username = whoami["body"]["username"]
+
+    body = await request.json()
+    doi = body.get("doi")
+    record_url = body.get("record_url")
+    title = body.get("title")
+    message_uuids = body.get("message_uuids")
+
+    if not doi or not message_uuids or not isinstance(message_uuids, list):
+        return Response(status_code=400, content="'doi' and 'message_uuids' are required", headers=resp_headers)
+
+    try:
+        validated_uuids = [str(uuid.UUID(u)) for u in message_uuids]
+    except ValueError:
+        return Response(status_code=400, content="Invalid UUID in message_uuids", headers=resp_headers)
+
+    doi_id = await archiveClient.record_doi(doi, record_url, title, username, validated_uuids)
+    return JSONResponse(content={"id": doi_id, "doi": doi}, status_code=201, headers=resp_headers)
