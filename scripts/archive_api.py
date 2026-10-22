@@ -6,7 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import argparse
 import collections
-import enum
 import logging
 import os
 import struct
@@ -19,10 +18,12 @@ from typing import List, Optional, Tuple
 
 import httpx
 import bson
+import json
 import hop
 
 from archive import access_api, utility_api
 from archive.mview import MMView
+from archive import zenodo_client
 
 parser = argparse.ArgumentParser()
 utility_api.add_parser_options(parser)
@@ -391,6 +392,8 @@ def has_permission(permission_set: Sequence[str], necessary_permission: str):
                  }
              },
          })
+
+
 async def fetch_message(request: Request,
                         msg_id: Annotated[str, Path(description="The ID of message item to get", 
                                                     json_schema_extra={"type": "string", "format": "uuid", "examples": ["457E145B-9F72-416F-87CA-73F0E188183D"]})],
@@ -424,270 +427,26 @@ async def fetch_message(request: Request,
 	if authorization is None:
 		return authentication_required();
 	
-	path_root=urlparse(config['hopauth_api_url']).path
-	topic_name = effective_topic_name_for_access(metadata.topic)
-	resp = await httpClient.post(config['hopauth_api_url']+"/v1/multi",
-							 json={
-							   "ops":{
-								 "method":"get",
-								 "path":f"{path_root}/v1/current_credential/permissions/topic/{topic_name}",
-								 "headers":{"Authorization": "Inherit"},
-							   },
-							   "whoami":{
-								 "method":"get",
-								 "path":f"{path_root}/v1/current_user",
-								 "headers":{"Authorization": "Inherit"},
-							   },
-							 },
-							 headers={"Authorization": authorization}
-							 )
-	
-	if resp.status_code == 401 and "www-authenticate" in resp.headers:
-		return Response(status_code=401, content=resp.content, 
-						headers={"www-authenticate": resp.headers["www-authenticate"]})
-	if resp.status_code == 403:
-		return Response(status_code=403, content="Forbidden")
-	if resp.status_code != 200:
-		logging.info(f"FETCH_MESSAGE request with auth data {authorization} from {request.client.host} failed with status {resp.status_code} and body {resp.text}")
-		return Response(status_code=500, content="Internal Error")
-	if "authentication-info" in resp.headers:
-		resp_headers["authentication-info"] = resp.headers["authentication-info"]
+	relay, hop_json, resp_headers = await _authenticate_and_authorize(
+		authorization, _topic_permission_paths([metadata.topic]))
+	if relay is not None:
+		return relay
 	# After this point it is important to always return a response with resp_headers
 	# as the client may be expecting the authentication-info!
-	
-	hop_json = resp.json()
-	if hop_json["whoami"]["status"]==200 and "body" in hop_json["whoami"] \
-		  and "username" in hop_json["whoami"]["body"] and "email" in hop_json["whoami"]["body"]:
-			user_id = f"user {hop_json['whoami']['body']['username']} ({hop_json['whoami']['body']['email']})"
+
+	user_id = "unauthenticated user"
+	whoami = hop_json.get("whoami", {})
+	if whoami.get("status") == 200 and "body" in whoami \
+		  and "username" in whoami["body"] and "email" in whoami["body"]:
+			user_id = f"user {whoami['body']['username']} ({whoami['body']['email']})"
 	
 	logging.info(f"FETCH_MESSAGE request by {user_id} from {request.client.host}")
-	allowed_ops = hop_json["ops"]["body"]["allowed_operations"]
-	if not isinstance(allowed_ops, collections.abc.Sequence):
-		return Response(status_code=500, content="Internal Error", headers=resp_headers)
-	if not has_permission(allowed_ops, "Read"):
+	if not _has_read_permission(hop_json, metadata.topic):
 		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
 	
 	# If the user is authorized, fetch the message from S3 and stream it back
 	return StreamingResponse(stream_s3_response(await archiveClient.get_object_lazily(metadata.key)),
 	                         headers=resp_headers)
-
-
-async def stream_raw_payload(s3_result):
-	def anext(iterator, default=None):
-		__anext__ = type(iterator).__anext__
-		async def anext_impl():
-			try:
-				return await __anext__(iterator)
-			except StopAsyncIteration:
-				return default
-		return anext_impl()
-	
-	iterator = s3_result['Body'].__aiter__()
-	current_chunk = await anext(iterator, None)
-	if current_chunk is None:
-		return
-	
-	current_offset = 0
-	len_remaining = 0
-	
-	async def read(amount: int):
-		nonlocal current_chunk
-		nonlocal current_offset
-		nonlocal len_remaining
-		value = bytearray()
-		while current_chunk is not None and amount > 0:
-			clen = len(current_chunk)
-			if amount <= clen:
-				value += current_chunk[current_offset:current_offset+amount]
-				current_offset += amount
-				amount = 0
-			else:
-				value += current_chunk[current_offset:]
-				amount -= (clen - current_offset)
-				current_offset = clen
-			if current_offset >= clen:
-				current_chunk = await anext(iterator, None)
-				current_offset = 0
-		if current_chunk is None and amount > 0:
-			raise ValueError("read: Early end of data stream")
-		len_remaining -= len(value)
-		return value
-
-	async def ignore(amount: int):
-		nonlocal current_chunk
-		nonlocal current_offset
-		nonlocal len_remaining
-		while current_chunk is not None and amount > 0:
-			clen = len(current_chunk)
-			if amount <= clen:
-				current_offset += amount
-				len_remaining -= amount
-				amount = 0
-			else:
-				amount -= (clen - current_offset)
-				len_remaining -= (clen - current_offset)
-				current_offset = clen
-			if current_offset >= clen:
-				current_chunk = await anext(iterator, None)
-				current_offset = 0
-		if current_chunk is None and amount > 0:
-			raise ValueError("ignore: Early end of data stream")
-
-	async def send(amount: int):
-		nonlocal current_chunk
-		nonlocal current_offset
-		nonlocal len_remaining
-		while current_chunk is not None and amount > 0:
-			clen = len(current_chunk)
-			if amount <= clen:
-				yield current_chunk[current_offset:current_offset+amount]
-				current_offset += amount
-				len_remaining -= amount
-				amount = 0
-			else:
-				yield current_chunk[current_offset:]
-				amount -= (clen - current_offset)
-				len_remaining -= (clen - current_offset)
-				current_offset = clen
-			if current_offset >= clen:
-				current_chunk = await anext(iterator, None)
-				current_offset = 0
-		if current_chunk is None and amount > 0:
-			raise ValueError("send: Early end of data stream")
-			
-	async def read_cstring():
-		value = bytearray()
-		while True:
-			c = await read(1)
-			if c == b'\x00':
-				return value.decode("utf-8")
-			value.extend(c)
-	
-	def decode_int32(data):
-		return struct.unpack("<i", data)[0]
-	
-	@enum.unique
-	class BSONType(enum.Enum):
-		double =      0x01
-		string =      0x02
-		document =    0x03
-		array =       0x04
-		binary =      0x05
-		undefined =   0x06
-		object_id =   0x07
-		bool =        0x08
-		datetime =    0x09
-		null =        0x0A
-		regex =       0x0B
-		db_pointer =  0x0C
-		javascript =  0x0D
-		symbol =      0x0E
-		scoped_code = 0x0F
-		int32 =       0x10
-		timestamp =   0x11
-		int64 =       0x12
-		decimal128 =  0x13
-		min_key =     0xFF
-		max_key =     0x7F
-
-	try:
-		len_remaining = decode_int32(await read(4))
-# 		print("Full document length:", len_remaining)
-		len_remaining -= 4
-		while len_remaining > 1:  # expect one byte for end of document
-			raw_e_type = await read(1)
-# 			print("  Element type:", raw_e_type.hex())
-			if raw_e_type[0] == 0:  # end of document
-				break
-			if len_remaining < 2:
-				raise ValueError("Malformed document")
-			try:
-				e_type = BSONType(raw_e_type[0])
-			except ValueError:
-				logging.warning(f"Unexpected element type for BSON 1.1: 0x{raw_e_type.hex()}")
-				return
-			e_name = await read_cstring()
-# 			print("  Element name:", e_name)
-			if len_remaining < 1:
-				raise ValueError("Malformed document")
-
-			# If this is our blessed sub-object, extract it
-			if e_type == BSONType.binary and e_name == "message":
-				raw_dlen = await read(4)
-				dlen = decode_int32(raw_dlen)
-				# plus one byte for subtype
-				if dlen + 1 >= len_remaining:
-					raise ValueError("Malformed binary: embedded binary longer than remainder of document")
-				# No one really cares what the subtype is; just extract and discard
-				subtype = await read(1)
-				async for chunk in send(dlen):
-					yield bytes(chunk)
-				# We don't really care what else was in the document; we won't send it, so skip
-				# reading and parsing it
-				return
-
-			# Otherwise, this is just something to skip over
-			if e_type == BSONType.double or e_type == BSONType.datetime \
-					or e_type == BSONType.timestamp or e_type == BSONType.int64:
-				await ignore(8)
-			elif e_type == BSONType.string or e_type == BSONType.javascript \
-					 or e_type == BSONType.symbol:
-				slen = decode_int32(await read(4))
-				if slen >= len_remaining:
-					raise ValueError("Malformed document: string longer than remainder of document")
-				await ignore(slen)
-			elif e_type == BSONType.document or e_type == BSONType.array:
-				dlen = decode_int32(await read(4))
-# 				print("    Document length:", dlen)
-				if dlen < 5:
-					raise ValueError("Malformed document: Too small length for embedded document")
-				dlen -= 4  # we already consumed the length
-				if dlen >= len_remaining:
-					raise ValueError("Malformed document: embedded document longer than remainder of document")
-				await ignore(dlen)
-# 				print("    Done skipping document, length remaining:", len_remaining)
-			elif e_type == BSONType.binary:
-				raw_dlen = await read(4)
-				dlen = decode_int32(raw_dlen)
-				# plus one byte for subtype
-				if dlen + 1 >= len_remaining:
-					raise ValueError("Malformed binary: embedded binary longer than remainder of document")
-				await ignore(dlen + 1)
-			elif e_type == BSONType.undefined or e_type == BSONType.null \
-					or e_type == BSONType.min_key or e_type == BSONType.max_key:
-				pass  # zero size element; nothing to do
-			elif e_type == BSONType.object_id:
-				await ignore(12)
-			elif e_type == BSONType.bool:
-				await ignore(1)
-			elif e_type == BSONType.regex:
-				_ = await read_cstring()
-				_ = await read_cstring()
-			elif e_type == BSONType.db_pointer:
-				slen = decode_int32(await read(4))
-				if slen >= len_remaining:
-					raise ValueError("Malformed document: DB pointer string longer than remainder of document")
-				await ignore(slen + 12)
-			elif e_type == BSONType.scoped_code:
-				clen = decode_int32(await read(4))
-				if clen < 10:
-					raise ValueError("Malformed document: Too small length for code with scope")
-				clen -= 4  # we already consumed the length
-				if clen >= len_remaining:
-					raise ValueError("Malformed document: code with scope longer than remainder of document")
-				await ignore(clen)
-			elif e_type == BSONType.int32:
-				await ignore(4)
-			elif e_type == BSONType.decimal128:
-				await ignore(16)
-			else:
-				raise ValueError(f"Internal Error: uncovered e_type: {e_type.value}")
-	except ValueError as err:
-		logging.warning(f"BSON decoding error: {err}")
-		return
-	except struct.error as err:
-		logging.warning(f"BSON decoding error: {err}")
-		return
 
 
 @app.get("/msg/{msg_id}/raw_file/{file_name}",
@@ -775,7 +534,7 @@ async def fetch_raw_message(request: Request,
 	if metadata.public:
 		logging.info(f"FETCH_RAW_MESSAGE request by {user_id} from {request.client.host}")
 		resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
-		return StreamingResponse(stream_raw_payload(await archiveClient.get_object_lazily(metadata.key)),
+		return StreamingResponse(archiveClient.get_file_stream(metadata.key),
 		                         headers=resp_headers)
 	
 	# Query hopauth to find out if the user is allowed to read this message.
@@ -828,7 +587,7 @@ async def fetch_raw_message(request: Request,
 	resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
 	
 	# If the user is authorized, fetch the message from S3 and stream it back
-	return StreamingResponse(stream_raw_payload(await archiveClient.get_object_lazily(metadata.key)),
+	return StreamingResponse(archiveClient.get_file_stream(metadata.key),
 	                         headers=resp_headers)
 
 
@@ -1963,20 +1722,24 @@ async def retract_message(request: Request,
 	return Response(status_code=200, content=bson.dumps({}), headers=resp_headers)
 
 
-async def _hopauth_multi(authorization: str, ops_path: Optional[str] = None):
+async def _authenticate_and_authorize(authorization: str, permission_paths: Optional[dict] = None):
     """
-    Perform a SCRAM-authenticated request to hopauth's /v1/multi endpoint,
-    always including a 'whoami' sub-request, and optionally a permission
-    check ('ops') sub-request for a specific path alongside it. This mirrors
-    fetch_message's inline handling exactly
+    Perform ONE SCRAM-authenticated request to hopauth's /v1/multi endpoint,
+    resolving the caller's identity (whoami) and, in the SAME call, checking
+    any number of named permissions at once.
+
+    permission_paths: optional dict of {result_key: hopauth_path} - each
+        entry becomes its own named sub-request in the /v1/multi call,
+        alongside the always-included 'whoami' entry.
 
     Returns a 3-tuple: (relay_response, hop_json, resp_headers)
       - If relay_response is not None, it must be returned to the original
-        caller immediately, as-is - the handshake is incomplete and this
+        caller immediately, as-is - the handshake is incomplete, and this
         gives the client what it needs to retry. hop_json and resp_headers
         are None in this case.
       - Otherwise, relay_response is None and hop_json / resp_headers hold
-        the parsed, successful result.
+        the parsed, successful result. hop_json contains a 'whoami' key and
+        one key per entry supplied in permission_paths.
     """
     path_root = urlparse(config['hopauth_api_url']).path
     body = {
@@ -1986,10 +1749,10 @@ async def _hopauth_multi(authorization: str, ops_path: Optional[str] = None):
             "headers": {"Authorization": "Inherit"},
         },
     }
-    if ops_path:
-        body["ops"] = {
+    for result_key, hop_path in (permission_paths or {}).items():
+        body[result_key] = {
             "method": "get",
-            "path": ops_path,
+            "path": hop_path,
             "headers": {"Authorization": "Inherit"},
         }
 
@@ -2005,7 +1768,7 @@ async def _hopauth_multi(authorization: str, ops_path: Optional[str] = None):
     if resp.status_code == 403:
         return Response(status_code=403, content="Forbidden"), None, None
     if resp.status_code != 200:
-        logging.error(f"_hopauth_multi: unexpected status {resp.status_code} body={resp.text}")
+        logging.error(f"_authenticate_and_authorize: unexpected status {resp.status_code} body={resp.text}")
         return Response(status_code=500, content="Internal Error"), None, None
 
     resp_headers = {}
@@ -2013,6 +1776,25 @@ async def _hopauth_multi(authorization: str, ops_path: Optional[str] = None):
         resp_headers["authentication-info"] = resp.headers["authentication-info"]
 
     return None, resp.json(), resp_headers
+
+
+def _topic_permission_paths(topics):
+    """
+    Build a {result_key: hopauth_path} dict of Read-permission-check
+    sub-requests, one per distinct topic, suitable for passing directly to
+    _authenticate_and_authorize's permission_paths argument.
+    """
+    path_root = urlparse(config['hopauth_api_url']).path
+    return {
+        f"topic_perm_{topic}":
+            f"{path_root}/v1/current_credential/permissions/topic/{effective_topic_name_for_access(topic)}"
+        for topic in topics
+    }
+
+
+def _has_read_permission(hop_json, topic):
+    allowed_ops = hop_json.get(f"topic_perm_{topic}", {}).get("body", {}).get("allowed_operations", [])
+    return isinstance(allowed_ops, collections.abc.Sequence) and has_permission(allowed_ops, "Read")
 
 
 @app.get("/doi/check")
@@ -2033,39 +1815,32 @@ async def check_dois(
     if not candidate_uuids:
         return Response(status_code=400, content="No valid message UUIDs supplied")
 
-    permitted_uuids = []
-    topic_permission_cache: dict[str, bool] = {}
-    resp_headers: dict[str, str] = {}
-    path_root = urlparse(config['hopauth_api_url']).path
-
+    # Resolve every candidate's topic BEFORE making any hopauth call, so
+    # every permission check needed for this request can be batched into a
+    # single /v1/multi call (see _authenticate_and_authorize's docstring).
+    uuid_to_topic = {}
     for message_uuid in candidate_uuids:
         metadata = await archiveClient.get_metadata(message_uuid)
-        if metadata is None:
-            continue
-        topic = metadata.topic
-        if topic not in topic_permission_cache:
-            base_topic_name = effective_topic_name_for_access(topic)
-            relay, hop_json, extra_headers = await _hopauth_multi(
-                authorization,
-                ops_path=f"{path_root}/v1/current_credential/permissions/topic/{base_topic_name}",
-            )
-            if relay is not None:
-                return relay
-            resp_headers.update(extra_headers or {})
-            allowed_ops = hop_json.get("ops", {}).get("body", {}).get("allowed_operations", [])
-            topic_permission_cache[topic] = (
-                isinstance(allowed_ops, collections.abc.Sequence) and has_permission(allowed_ops, "Read")
-            )
-        if topic_permission_cache[topic]:
-            permitted_uuids.append(message_uuid)
+        if metadata is not None:
+            uuid_to_topic[message_uuid] = metadata.topic
+
+    distinct_topics = sorted(set(uuid_to_topic.values()))
+    relay, hop_json, resp_headers = await _authenticate_and_authorize(
+        authorization, _topic_permission_paths(distinct_topics))
+    if relay is not None:
+        return relay
+
+    permitted_topics = {topic for topic in distinct_topics if _has_read_permission(hop_json, topic)}
+    permitted_uuids = [u for u in candidate_uuids if uuid_to_topic.get(u) in permitted_topics]
 
     if not permitted_uuids:
-        return JSONResponse(content={"conflicts": []}, headers=resp_headers)
+        return JSONResponse(content={"status": "ok"}, headers=resp_headers)
 
-    # find_dois_for_messages already returns EVERY message belonging to any
-    # DOI that overlaps at all with our candidate set - not just the
-    # overlapping members - so total size and matched subset can both be
-    # computed from this single result set.
+    # find_dois_for_messages returns one row per (doi, message_uuid) pairing,
+    # already including EVERY message belonging to any DOI that overlaps at
+    # all with our permitted set - not just the overlapping members - so
+    # each DOI's total size and matched subset can both be computed from
+    # this single result set.
     rows = await archiveClient.find_dois_for_messages(permitted_uuids)
 
     by_doi: dict[int, dict] = {}
@@ -2083,52 +1858,151 @@ async def check_dois(
         if str(row.message_uuid) in permitted_uuids:
             by_doi[doi_id]["matched_uuids"].add(str(row.message_uuid))
 
+    # An exact match - the whole candidate set is identical to an existing
+    # DOI's whole message set - is a hard block, regardless of package size.
+    candidate_set_size = len(candidate_uuids)
+    for entry in by_doi.values():
+        if len(entry["matched_uuids"]) == entry["total_message_count"] == candidate_set_size:
+            return JSONResponse(content={
+                "status": "blocked",
+                "doi": entry["doi"],
+                "record_url": entry["record_url"],
+                "title": entry["title"],
+            }, headers=resp_headers)
+
+    # Any partial overlap - a message reused from, or shared with, some
+    # other DOI - is a non-blocking warning.
     conflicts = [
         {
             "doi": entry["doi"],
             "record_url": entry["record_url"],
             "title": entry["title"],
-            "total_message_count": entry["total_message_count"],
-            "matched_count": len(entry["matched_uuids"]),
             "matched_uuids": sorted(entry["matched_uuids"]),
         }
         for entry in by_doi.values()
-        if entry["matched_uuids"]  # only report DOIs that actually overlap a permitted uuid
+        if entry["matched_uuids"]
     ]
 
-    return JSONResponse(content={"conflicts": conflicts}, headers=resp_headers)
+    if conflicts:
+        return JSONResponse(content={"status": "warning", "conflicts": conflicts}, headers=resp_headers)
+
+    return JSONResponse(content={"status": "ok"}, headers=resp_headers)
 
 
-@app.post("/doi/")
-async def record_doi(
+@app.post("/doi/mint")
+async def mint_doi(
     request: Request,
     authorization: Annotated[Union[str, None], Header(description="RFC 7804 SCRAM authentication")] = None,
 ):
     if authorization is None:
         return authentication_required()
 
-    relay, hop_json, resp_headers = await _hopauth_multi(authorization)
+    raw = await request.body()
+
+    # First request of a SCRAM handshake: no body. Authenticate only, so HopAuth's
+    # 401 challenge is relayed and the client retries with the body.
+    if not raw:
+        relay, _, resp_headers = await _authenticate_and_authorize(authorization)
+        if relay is not None:
+            return relay
+        return Response(status_code=400, content="Request body is required", headers=resp_headers)
+
+    # From here on this is the authenticated request. EVERY response, errors
+    # included, must carry HopAuth's Authentication-Info header (resp_headers),
+    # otherwise the Hermes SCRAM client raises "Missing sid in SCRAM server
+    # final". So problems are only recorded in `error` / `missing` here and
+    # returned AFTER the authentication call below.
+    error = None
+    candidate_uuids = []
+    zenodo_metadata = None
+
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("not an object")
+    except ValueError:
+        body = {}
+        error = (400, "Request body must be a JSON object")
+
+    if error is None:
+        message_uuids = body.get("message_uuids")
+        zenodo_metadata = body.get("metadata")
+        if not message_uuids or not isinstance(message_uuids, list):
+            error = (400, "'message_uuids' must be a non-empty list")
+        elif (not isinstance(zenodo_metadata, dict)
+              or not zenodo_metadata.get("title") or not zenodo_metadata.get("creators")):
+            error = (400, "'metadata' must include at least 'title' and 'creators'")
+        else:
+            try:
+                candidate_uuids = [str(uuid.UUID(u)) for u in message_uuids]
+            except (ValueError, TypeError, AttributeError):
+                error = (400, "Invalid UUID in message_uuids")
+
+    uuid_to_record = {}
+    missing = []
+    for message_uuid in candidate_uuids:
+        record = await archiveClient.get_metadata(message_uuid)
+        if record is None:
+            missing.append(message_uuid)
+        else:
+            uuid_to_record[message_uuid] = record
+
+    distinct_topics = sorted({r.topic for r in uuid_to_record.values()})
+    relay, hop_json, resp_headers = await _authenticate_and_authorize(
+        authorization, _topic_permission_paths(distinct_topics))
     if relay is not None:
         return relay
+
+    # ---- authenticated: every return below carries resp_headers ----
+    if error is not None:
+        return Response(status_code=error[0], content=error[1], headers=resp_headers)
+    if missing:
+        return Response(status_code=404, content=f"No such message(s): {', '.join(missing)}",
+                        headers=resp_headers)
+
+    for topic in distinct_topics:
+        if not _has_read_permission(hop_json, topic):
+            return Response(status_code=403, content=f"Read permission required on topic '{topic}'",
+                            headers=resp_headers)
 
     whoami = hop_json.get("whoami", {})
     if whoami.get("status") != 200 or "username" not in whoami.get("body", {}):
         return Response(status_code=403, content="Forbidden", headers=resp_headers)
     username = whoami["body"]["username"]
 
-    body = await request.json()
-    doi = body.get("doi")
-    record_url = body.get("record_url")
-    title = body.get("title")
-    message_uuids = body.get("message_uuids")
-
-    if not doi or not message_uuids or not isinstance(message_uuids, list):
-        return Response(status_code=400, content="'doi' and 'message_uuids' are required", headers=resp_headers)
+    if not zenodo_client.is_configured(config):
+        return Response(status_code=501,
+                        content="Zenodo minting is not configured on this archive instance",
+                        headers=resp_headers)
 
     try:
-        validated_uuids = [str(uuid.UUID(u)) for u in message_uuids]
-    except ValueError:
-        return Response(status_code=400, content="Invalid UUID in message_uuids", headers=resp_headers)
+        # Check every message's content is in the store BEFORE creating anything on Zenodo.
+        unavailable = []
+        for message_uuid, record in uuid_to_record.items():
+            summary = await archiveClient.get_object_summary(record.key)
+            if not summary.get("exists"):
+                unavailable.append(message_uuid)
+        if unavailable:
+            return Response(status_code=404,
+                            content=f"Stored content not available for message(s): {', '.join(unavailable)}",
+                            headers=resp_headers)
 
-    doi_id = await archiveClient.record_doi(doi, record_url, title, username, validated_uuids)
-    return JSONResponse(content={"id": doi_id, "doi": doi}, status_code=201, headers=resp_headers)
+        published = await archiveClient.mint_doi(config, zenodo_metadata, candidate_uuids,
+                                                 created_by=username)
+    except zenodo_client.ZenodoNotConfiguredError as e:
+        return Response(status_code=501, content=str(e), headers=resp_headers)
+    except zenodo_client.ZenodoError as e:
+        logging.error(f"DOI minting failed for {username}: {e}")
+        return Response(status_code=502, content=str(e), headers=resp_headers)
+    except Exception:
+        # Anything unexpected must still carry the headers, or the client crashes
+        # with a confusing SCRAM error instead of showing the real failure.
+        logging.exception(f"Unexpected error minting DOI for {username}")
+        return Response(status_code=500, content="Internal error while minting DOI",
+                        headers=resp_headers)
+
+    return JSONResponse(
+        content={"doi": published["doi"], "record_url": published["links"]["record_html"]},
+        status_code=201,
+        headers=resp_headers,
+    )

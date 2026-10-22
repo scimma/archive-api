@@ -1,4 +1,5 @@
 archive-core @ git+https://github.com/scimma/archive-core@v1.3.1
+# TODO: The URL above  needs to update once the archive-core version including DOI changes is up
 fastapi
 hop-client
 httpx
