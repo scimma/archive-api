@@ -18,7 +18,6 @@ from typing import List, Optional, Tuple
 
 import httpx
 import bson
-import json
 import hop
 
 from archive import access_api, utility_api
@@ -392,8 +391,6 @@ def has_permission(permission_set: Sequence[str], necessary_permission: str):
                  }
              },
          })
-
-
 async def fetch_message(request: Request,
                         msg_id: Annotated[str, Path(description="The ID of message item to get", 
                                                     json_schema_extra={"type": "string", "format": "uuid", "examples": ["457E145B-9F72-416F-87CA-73F0E188183D"]})],
@@ -534,7 +531,7 @@ async def fetch_raw_message(request: Request,
 	if metadata.public:
 		logging.info(f"FETCH_RAW_MESSAGE request by {user_id} from {request.client.host}")
 		resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
-		return StreamingResponse(archiveClient.get_file_stream(metadata.key),
+		return StreamingResponse(archiveClient.stream_raw_message_payload(metadata.key),
 		                         headers=resp_headers)
 	
 	# Query hopauth to find out if the user is allowed to read this message.
@@ -587,7 +584,7 @@ async def fetch_raw_message(request: Request,
 	resp_headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
 	
 	# If the user is authorized, fetch the message from S3 and stream it back
-	return StreamingResponse(archiveClient.get_file_stream(metadata.key),
+	return StreamingResponse(archiveClient.stream_raw_message_payload(metadata.key),
 	                         headers=resp_headers)
 
 
@@ -1723,286 +1720,445 @@ async def retract_message(request: Request,
 
 
 async def _authenticate_and_authorize(authorization: str, permission_paths: Optional[dict] = None):
-    """
-    Perform ONE SCRAM-authenticated request to hopauth's /v1/multi endpoint,
-    resolving the caller's identity (whoami) and, in the SAME call, checking
-    any number of named permissions at once.
+	"""
+	Perform ONE SCRAM-authenticated request to hopauth's /v1/multi endpoint,
+	resolving the caller's identity (whoami) and, in the SAME call, checking
+	any number of named permissions at once.
 
-    permission_paths: optional dict of {result_key: hopauth_path} - each
-        entry becomes its own named sub-request in the /v1/multi call,
-        alongside the always-included 'whoami' entry.
+	permission_paths: optional dict of {result_key: hopauth_path} - each
+		entry becomes its own named sub-request in the /v1/multi call,
+		alongside the always-included 'whoami' entry.
 
-    Returns a 3-tuple: (relay_response, hop_json, resp_headers)
-      - If relay_response is not None, it must be returned to the original
-        caller immediately, as-is - the handshake is incomplete, and this
-        gives the client what it needs to retry. hop_json and resp_headers
-        are None in this case.
-      - Otherwise, relay_response is None and hop_json / resp_headers hold
-        the parsed, successful result. hop_json contains a 'whoami' key and
-        one key per entry supplied in permission_paths.
-    """
-    path_root = urlparse(config['hopauth_api_url']).path
-    body = {
-        "whoami": {
-            "method": "get",
-            "path": f"{path_root}/v1/current_user",
-            "headers": {"Authorization": "Inherit"},
-        },
-    }
-    for result_key, hop_path in (permission_paths or {}).items():
-        body[result_key] = {
-            "method": "get",
-            "path": hop_path,
-            "headers": {"Authorization": "Inherit"},
-        }
+	Returns a 3-tuple: (relay_response, hop_json, resp_headers)
+	  - If relay_response is not None, it must be returned to the original
+		caller immediately, as-is - the handshake is incomplete, and this
+		gives the client what it needs to retry. hop_json and resp_headers
+		are None in this case.
+	  - Otherwise, relay_response is None and hop_json / resp_headers hold
+		the parsed, successful result. hop_json contains a 'whoami' key and
+		one key per entry supplied in permission_paths.
+	"""
+	path_root = urlparse(config['hopauth_api_url']).path
+	body = {
+		"whoami": {
+			"method": "get",
+			"path": f"{path_root}/v1/current_user",
+			"headers": {"Authorization": "Inherit"},
+		},
+	}
+	for result_key, hop_path in (permission_paths or {}).items():
+		body[result_key] = {
+			"method": "get",
+			"path": hop_path,
+			"headers": {"Authorization": "Inherit"},
+		}
 
-    resp = await httpClient.post(
-        config['hopauth_api_url'] + "/v1/multi",
-        json=body,
-        headers={"Authorization": authorization},
-    )
+	resp = await httpClient.post(
+		config['hopauth_api_url'] + "/v1/multi",
+		json=body,
+		headers={"Authorization": authorization},
+	)
 
-    if resp.status_code == 401 and "www-authenticate" in resp.headers:
-        return Response(status_code=401, content=resp.content,
-                         headers={"www-authenticate": resp.headers["www-authenticate"]}), None, None
-    if resp.status_code == 403:
-        return Response(status_code=403, content="Forbidden"), None, None
-    if resp.status_code != 200:
-        logging.error(f"_authenticate_and_authorize: unexpected status {resp.status_code} body={resp.text}")
-        return Response(status_code=500, content="Internal Error"), None, None
+	if resp.status_code == 401 and "www-authenticate" in resp.headers:
+		return Response(status_code=401, content=resp.content,
+						 headers={"www-authenticate": resp.headers["www-authenticate"]}), None, None
+	if resp.status_code == 403:
+		return Response(status_code=403, content="Forbidden"), None, None
+	if resp.status_code != 200:
+		logging.error(f"_authenticate_and_authorize: unexpected status {resp.status_code} body={resp.text}")
+		return Response(status_code=500, content="Internal Error"), None, None
 
-    resp_headers = {}
-    if "authentication-info" in resp.headers:
-        resp_headers["authentication-info"] = resp.headers["authentication-info"]
+	resp_headers = {}
+	if "authentication-info" in resp.headers:
+		resp_headers["authentication-info"] = resp.headers["authentication-info"]
 
-    return None, resp.json(), resp_headers
+	return None, resp.json(), resp_headers
 
 
 def _topic_permission_paths(topics):
-    """
-    Build a {result_key: hopauth_path} dict of Read-permission-check
-    sub-requests, one per distinct topic, suitable for passing directly to
-    _authenticate_and_authorize's permission_paths argument.
-    """
-    path_root = urlparse(config['hopauth_api_url']).path
-    return {
-        f"topic_perm_{topic}":
-            f"{path_root}/v1/current_credential/permissions/topic/{effective_topic_name_for_access(topic)}"
-        for topic in topics
-    }
+	"""
+	Build a {result_key: hopauth_path} dict of Read-permission-check
+	sub-requests, one per distinct topic, suitable for passing directly to
+	_authenticate_and_authorize's permission_paths argument.
+	"""
+	path_root = urlparse(config['hopauth_api_url']).path
+	return {
+		f"topic_perm_{topic}":
+			f"{path_root}/v1/current_credential/permissions/topic/{effective_topic_name_for_access(topic)}"
+		for topic in topics
+	}
 
 
 def _has_read_permission(hop_json, topic):
-    allowed_ops = hop_json.get(f"topic_perm_{topic}", {}).get("body", {}).get("allowed_operations", [])
-    return isinstance(allowed_ops, collections.abc.Sequence) and has_permission(allowed_ops, "Read")
+	allowed_ops = hop_json.get(f"topic_perm_{topic}", {}).get("body", {}).get("allowed_operations", [])
+	return isinstance(allowed_ops, collections.abc.Sequence) and has_permission(allowed_ops, "Read")
 
 
-@app.get("/doi/check")
+def _text_response_doc(description, *examples):
+	"""Build the OpenAPI documentation entry for a plain text response."""
+	schema = {"type": "string"}
+	if examples:
+		schema["examples"] = list(examples)
+	return {"description": description, "content": {"text/plain": {"schema": schema}}}
+
+
+def _bson_response(content: dict, resp_headers: dict, status_code: int = 200):
+	"""Encode content as a BSON response, preserving any SCRAM authentication-info headers."""
+	return Response(status_code=status_code, content=bson.dumps(content),
+					media_type="application/bson", headers=resp_headers)
+
+
+def _parse_doi_mint_request(raw: bytes):
+	"""
+	Decode and validate the body of a /doi/mint request.
+
+	Returns: a (message_uuids, zenodo_metadata) tuple.
+	Raises: ValueError with a message suitable to show to the client if the request is invalid.
+	"""
+	try:
+		data = bson.loads(raw)
+	except Exception:
+		raise ValueError("Request must be valid BSON")
+	if not isinstance(data, collections.abc.Mapping):
+		raise ValueError("Request body must be a BSON document")
+
+	message_uuids = data.get("message_uuids")
+	if not isinstance(message_uuids, list) or not message_uuids:
+		raise ValueError("'message_uuids' must be a non-empty list")
+	zenodo_metadata = data.get("metadata")
+	if not isinstance(zenodo_metadata, collections.abc.Mapping) \
+	  or not zenodo_metadata.get("title") or not zenodo_metadata.get("creators"):
+		raise ValueError("'metadata' must include at least 'title' and 'creators'")
+	try:
+		# normalize the IDs, and drop any duplicates (which would violate the record of the DOI)
+		message_uuids = list(dict.fromkeys(str(uuid.UUID(u)) for u in message_uuids))
+	except (ValueError, TypeError, AttributeError):
+		raise ValueError("Invalid UUID in message_uuids")
+	return message_uuids, dict(zenodo_metadata)
+
+
+@app.get("/doi/check",
+         description="Check whether a set of messages, which someone is considering using to mint a DOI, "
+                     "overlaps with the messages of any DOI which has already been minted via this archive. "
+                     "If the set is exactly the same as the message set of an existing DOI, the status is "
+                     "'blocked'; if some of the messages are also part of other DOIs, the status is "
+                     "'warning'; otherwise it is 'ok'. "
+                     "Authentication via SCRAM is required. Only messages from topics which the authenticated "
+                     "user has permission to read are considered, so the answer reveals nothing about messages "
+                     "the user could not read anyway.",
+         response_class=Response,
+         responses={
+             200: {
+                 "description": "The result of the check. Note that the format is BSON.",
+                 "content": {
+                     "application/bson": {
+                         "schema": {
+                             "type": "object",
+                             "properties": {
+                                 "status": {
+                                     "type": "string",
+                                     "enum": ["ok", "warning", "blocked"],
+                                     "description": "Whether minting a DOI for the message set is fine (ok), "
+                                                    "duplicates part of an existing DOI (warning), or "
+                                                    "duplicates an existing DOI exactly (blocked).",
+                                 },
+                                 "doi": {
+                                     "type": "string",
+                                     "description": "For status 'blocked': the existing DOI.",
+                                 },
+                                 "record_url": {
+                                     "type": "string",
+                                     "description": "For status 'blocked': the URL of the existing DOI's record.",
+                                 },
+                                 "title": {
+                                     "type": "string",
+                                     "description": "For status 'blocked': the title of the existing DOI's record.",
+                                 },
+                                 "conflicts": {
+                                     "type": "array",
+                                     "description": "For status 'warning': the existing DOIs which share "
+                                                    "messages with the checked set.",
+                                     "items": {
+                                         "type": "object",
+                                         "properties": {
+                                             "doi": {"type": "string"},
+                                             "record_url": {"type": "string"},
+                                             "title": {"type": "string"},
+                                             "matched_uuids": {
+                                                 "type": "array",
+                                                 "description": "The checked messages which are part of this DOI.",
+                                                 "items": {"type": "string", "format": "uuid"},
+                                             },
+                                         },
+                                     },
+                                 },
+                             },
+                             "required": ["status"],
+                         }
+                     }
+                 }
+             },
+             400: _text_response_doc("Bad request. None of the supplied message IDs was well-formed.",
+                                     "No valid message UUIDs supplied"),
+             401: _text_response_doc("Authentication required."),
+         })
 async def check_dois(
     request: Request,
     message_uuids: Annotated[List[str], Query(alias="uuid", description="One or more message UUIDs to check")],
     authorization: Annotated[Union[str, None], Header(description="RFC 7804 SCRAM authentication")] = None,
 ):
-    if authorization is None:
-        return authentication_required()
+	if authorization is None:
+		return authentication_required()
 
-    candidate_uuids = []
-    for u in message_uuids:
-        try:
-            candidate_uuids.append(str(uuid.UUID(u)))
-        except ValueError:
-            continue
-    if not candidate_uuids:
-        return Response(status_code=400, content="No valid message UUIDs supplied")
+	candidate_uuids = []
+	for u in message_uuids:
+		try:
+			candidate_uuids.append(str(uuid.UUID(u)))
+		except ValueError:
+			continue
+	candidate_uuids = list(dict.fromkeys(candidate_uuids))  # drop duplicates, keeping order
+	if not candidate_uuids:
+		return Response(status_code=400, content="No valid message UUIDs supplied")
 
-    # Resolve every candidate's topic BEFORE making any hopauth call, so
-    # every permission check needed for this request can be batched into a
-    # single /v1/multi call (see _authenticate_and_authorize's docstring).
-    uuid_to_topic = {}
-    for message_uuid in candidate_uuids:
-        metadata = await archiveClient.get_metadata(message_uuid)
-        if metadata is not None:
-            uuid_to_topic[message_uuid] = metadata.topic
+	# Resolve every candidate's topic BEFORE making any hopauth call, so
+	# every permission check needed for this request can be batched into a
+	# single /v1/multi call (see _authenticate_and_authorize's docstring).
+	uuid_to_topic = {}
+	for message_uuid in candidate_uuids:
+		metadata = await archiveClient.get_metadata(message_uuid)
+		if metadata is not None:
+			uuid_to_topic[message_uuid] = metadata.topic
 
-    distinct_topics = sorted(set(uuid_to_topic.values()))
-    relay, hop_json, resp_headers = await _authenticate_and_authorize(
-        authorization, _topic_permission_paths(distinct_topics))
-    if relay is not None:
-        return relay
+	distinct_topics = sorted(set(uuid_to_topic.values()))
+	relay, hop_json, resp_headers = await _authenticate_and_authorize(
+		authorization, _topic_permission_paths(distinct_topics))
+	if relay is not None:
+		return relay
+	# After this point it is important to always return a response with resp_headers
+	# as the client may be expecting the authentication-info!
 
-    permitted_topics = {topic for topic in distinct_topics if _has_read_permission(hop_json, topic)}
-    permitted_uuids = [u for u in candidate_uuids if uuid_to_topic.get(u) in permitted_topics]
+	permitted_topics = {topic for topic in distinct_topics if _has_read_permission(hop_json, topic)}
+	permitted_uuids = [u for u in candidate_uuids if uuid_to_topic.get(u) in permitted_topics]
 
-    if not permitted_uuids:
-        return JSONResponse(content={"status": "ok"}, headers=resp_headers)
+	if not permitted_uuids:
+		return _bson_response({"status": "ok"}, resp_headers)
 
-    # find_dois_for_messages returns one row per (doi, message_uuid) pairing,
-    # already including EVERY message belonging to any DOI that overlaps at
-    # all with our permitted set - not just the overlapping members - so
-    # each DOI's total size and matched subset can both be computed from
-    # this single result set.
-    rows = await archiveClient.find_dois_for_messages(permitted_uuids)
+	# find_dois_for_messages returns one row per (doi, message_uuid) pairing,
+	# for EVERY message belonging to any DOI that overlaps at all with our
+	# permitted set - not just the overlapping members - so each DOI's total
+	# size and matched subset can both be computed from this single result set.
+	rows = await archiveClient.find_dois_for_messages(permitted_uuids)
 
-    by_doi: dict[int, dict] = {}
-    for row in rows:
-        doi_id = row.id
-        if doi_id not in by_doi:
-            by_doi[doi_id] = {
-                "doi": row.doi,
-                "record_url": row.record_url,
-                "title": row.title,
-                "total_message_count": 0,
-                "matched_uuids": set(),
-            }
-        by_doi[doi_id]["total_message_count"] += 1
-        if str(row.message_uuid) in permitted_uuids:
-            by_doi[doi_id]["matched_uuids"].add(str(row.message_uuid))
+	by_doi: dict[int, dict] = {}
+	for row in rows:
+		doi_id = row.id
+		if doi_id not in by_doi:
+			by_doi[doi_id] = {
+				"doi": row.doi,
+				"record_url": row.record_url,
+				"title": row.title,
+				"total_message_count": 0,
+				"matched_uuids": set(),
+			}
+		by_doi[doi_id]["total_message_count"] += 1
+		if str(row.message_uuid) in permitted_uuids:
+			by_doi[doi_id]["matched_uuids"].add(str(row.message_uuid))
 
-    # An exact match - the whole candidate set is identical to an existing
-    # DOI's whole message set - is a hard block, regardless of package size.
-    candidate_set_size = len(candidate_uuids)
-    for entry in by_doi.values():
-        if len(entry["matched_uuids"]) == entry["total_message_count"] == candidate_set_size:
-            return JSONResponse(content={
-                "status": "blocked",
-                "doi": entry["doi"],
-                "record_url": entry["record_url"],
-                "title": entry["title"],
-            }, headers=resp_headers)
+	# An exact match - the whole candidate set is identical to an existing
+	# DOI's whole message set - is a hard block, regardless of package size.
+	candidate_set_size = len(candidate_uuids)
+	for entry in by_doi.values():
+		if len(entry["matched_uuids"]) == entry["total_message_count"] == candidate_set_size:
+			return _bson_response({
+				"status": "blocked",
+				"doi": entry["doi"],
+				"record_url": entry["record_url"],
+				"title": entry["title"],
+			}, resp_headers)
 
-    # Any partial overlap - a message reused from, or shared with, some
-    # other DOI - is a non-blocking warning.
-    conflicts = [
-        {
-            "doi": entry["doi"],
-            "record_url": entry["record_url"],
-            "title": entry["title"],
-            "matched_uuids": sorted(entry["matched_uuids"]),
-        }
-        for entry in by_doi.values()
-        if entry["matched_uuids"]
-    ]
+	# Any partial overlap - a message reused from, or shared with, some
+	# other DOI - is a non-blocking warning.
+	conflicts = [
+		{
+			"doi": entry["doi"],
+			"record_url": entry["record_url"],
+			"title": entry["title"],
+			"matched_uuids": sorted(entry["matched_uuids"]),
+		}
+		for entry in by_doi.values()
+		if entry["matched_uuids"]
+	]
 
-    if conflicts:
-        return JSONResponse(content={"status": "warning", "conflicts": conflicts}, headers=resp_headers)
+	if conflicts:
+		return _bson_response({"status": "warning", "conflicts": conflicts}, resp_headers)
 
-    return JSONResponse(content={"status": "ok"}, headers=resp_headers)
+	return _bson_response({"status": "ok"}, resp_headers)
 
 
-@app.post("/doi/mint")
+@app.post("/doi/mint",
+          description="Mint a DOI (via Zenodo) for one or more archived messages, and record which messages "
+                      "it covers, as a single operation. Each message is deposited as one file: messages "
+                      "archived with a file name have their body deposited as that file, and all others are "
+                      "deposited as a JSON rendering of the stored message. "
+                      "Authentication via SCRAM is required. Minting publishes data, but does not alter "
+                      "or add anything to the archive's messages, so it requires only that the user has "
+                      "permission to read each of the topics the messages belong to, just as when "
+                      "retrieving the messages themselves; permission to write to the topics is not needed. "
+                      "Use /doi/check beforehand to find out whether the messages were already used for a DOI. "
+                      "This route is only available if the archive has been configured with Zenodo access.",
+          response_class=Response,
+          openapi_extra={
+              "requestBody": {
+                  "required": True,
+                  "content": {
+                      "application/bson": {
+                          "schema": {
+                              "type": "object",
+                              "properties": {
+                                  "message_uuids": {
+                                      "type": "array",
+                                      "description": "The IDs of the messages to include in the DOI.",
+                                      "minItems": 1,
+                                      "items": {"type": "string", "format": "uuid"},
+                                  },
+                                  "metadata": {
+                                      "type": "object",
+                                      "description": "The Zenodo metadata for the record to create.",
+                                      "properties": {
+                                          "title": {"type": "string"},
+                                          "description": {"type": "string"},
+                                          "creators": {
+                                              "type": "array",
+                                              "minItems": 1,
+                                              "items": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                      "name": {"type": "string"},
+                                                      "affiliation": {"type": "string"},
+                                                  },
+                                                  "required": ["name"],
+                                              },
+                                          },
+                                          "keywords": {"type": "array", "items": {"type": "string"}},
+                                      },
+                                      "required": ["title", "creators"],
+                                  },
+                              },
+                              "required": ["message_uuids", "metadata"],
+                          }
+                      }
+                  }
+              }
+          },
+          status_code=201,
+          responses={
+              201: {
+                  "description": "The DOI was minted and recorded. Note that the format is BSON.",
+                  "content": {
+                      "application/bson": {
+                          "schema": {
+                              "type": "object",
+                              "properties": {
+                                  "doi": {"type": "string", "description": "The new DOI."},
+                                  "record_url": {"type": "string", "description": "The URL of the new DOI's record."},
+                              },
+                              "required": ["doi", "record_url"],
+                          }
+                      }
+                  }
+              },
+              400: _text_response_doc("Bad request. This may be caused by an ill-formed request body.",
+                                      "Request must be valid BSON",
+                                      "'message_uuids' must be a non-empty list",
+                                      "'metadata' must include at least 'title' and 'creators'",
+                                      "Invalid UUID in message_uuids"),
+              401: _text_response_doc("Authentication required."),
+              403: _text_response_doc("Not authorized. The authenticated user does not have permission to read "
+                                      "one of the topics the messages belong to.",
+                                      "Read permission required on topic '{topic}'"),
+              404: _text_response_doc("Message not found. One of the specified messages does not exist, "
+                                      "or its content is no longer available.",
+                                      "No such message: {message_id}"),
+              501: _text_response_doc("Not supported. This archive instance is not configured to mint DOIs.",
+                                      "Zenodo minting is not configured on this archive instance"),
+              502: _text_response_doc("Zenodo reported a failure."),
+              500: _text_response_doc("Internal error.", "Internal error while minting DOI"),
+          })
 async def mint_doi(
     request: Request,
     authorization: Annotated[Union[str, None], Header(description="RFC 7804 SCRAM authentication")] = None,
 ):
-    if authorization is None:
-        return authentication_required()
+	if authorization is None:
+		return authentication_required()
 
-    raw = await request.body()
+	# Some SCRAM clients leave the body out of the early requests of the handshake and send it
+	# only with the last one, while others send it every time. Either way, whether there is a
+	# body yet does not affect the handshake itself, which is entirely handled by hopauth below;
+	# this only determines which topics we can ask hopauth about in the same request.
+	message_uuids = []
+	zenodo_metadata = None
+	uuid_to_record = {}
+	raw = await request.body()
+	if raw:
+		try:
+			message_uuids, zenodo_metadata = _parse_doi_mint_request(raw)
+		except ValueError as err:
+			return Response(status_code=400, content=str(err))
+		for message_uuid in message_uuids:
+			record = await archiveClient.get_metadata(message_uuid)
+			if record is None:
+				return Response(status_code=404, content=f"No such message: {message_uuid}")
+			uuid_to_record[message_uuid] = record
 
-    # First request of a SCRAM handshake: no body. Authenticate only, so HopAuth's
-    # 401 challenge is relayed and the client retries with the body.
-    if not raw:
-        relay, _, resp_headers = await _authenticate_and_authorize(authorization)
-        if relay is not None:
-            return relay
-        return Response(status_code=400, content="Request body is required", headers=resp_headers)
+	distinct_topics = sorted({r.topic for r in uuid_to_record.values()})
+	relay, hop_json, resp_headers = await _authenticate_and_authorize(
+		authorization, _topic_permission_paths(distinct_topics))
+	if relay is not None:
+		return relay
+	# After this point it is important to always return a response with resp_headers
+	# as the client may be expecting the authentication-info!
 
-    # From here on this is the authenticated request. EVERY response, errors
-    # included, must carry HopAuth's Authentication-Info header (resp_headers),
-    # otherwise the Hermes SCRAM client raises "Missing sid in SCRAM server
-    # final". So problems are only recorded in `error` / `missing` here and
-    # returned AFTER the authentication call below.
-    error = None
-    candidate_uuids = []
-    zenodo_metadata = None
+	if not message_uuids:
+		return Response(status_code=400, content="Request body is required", headers=resp_headers)
 
-    try:
-        body = json.loads(raw)
-        if not isinstance(body, dict):
-            raise ValueError("not an object")
-    except ValueError:
-        body = {}
-        error = (400, "Request body must be a JSON object")
+	whoami = hop_json.get("whoami", {})
+	if whoami.get("status") != 200 or "username" not in whoami.get("body", {}):
+		return Response(status_code=403, content="Forbidden", headers=resp_headers)
+	username = whoami["body"]["username"]
 
-    if error is None:
-        message_uuids = body.get("message_uuids")
-        zenodo_metadata = body.get("metadata")
-        if not message_uuids or not isinstance(message_uuids, list):
-            error = (400, "'message_uuids' must be a non-empty list")
-        elif (not isinstance(zenodo_metadata, dict)
-              or not zenodo_metadata.get("title") or not zenodo_metadata.get("creators")):
-            error = (400, "'metadata' must include at least 'title' and 'creators'")
-        else:
-            try:
-                candidate_uuids = [str(uuid.UUID(u)) for u in message_uuids]
-            except (ValueError, TypeError, AttributeError):
-                error = (400, "Invalid UUID in message_uuids")
+	# Reading is the right permission to require, not writing: minting a DOI does not write
+	# anything to the topics, it publishes a copy of messages the user is already entitled to see.
+	for topic in distinct_topics:
+		if not _has_read_permission(hop_json, topic):
+			return Response(status_code=403, content=f"Read permission required on topic '{topic}'",
+							headers=resp_headers)
 
-    uuid_to_record = {}
-    missing = []
-    for message_uuid in candidate_uuids:
-        record = await archiveClient.get_metadata(message_uuid)
-        if record is None:
-            missing.append(message_uuid)
-        else:
-            uuid_to_record[message_uuid] = record
+	if not archiveClient.doi_minting_enabled():
+		return Response(status_code=501,
+						content="Zenodo minting is not configured on this archive instance",
+						headers=resp_headers)
 
-    distinct_topics = sorted({r.topic for r in uuid_to_record.values()})
-    relay, hop_json, resp_headers = await _authenticate_and_authorize(
-        authorization, _topic_permission_paths(distinct_topics))
-    if relay is not None:
-        return relay
+	try:
+		# Check every message's content is in the store BEFORE creating anything on Zenodo.
+		for message_uuid, record in uuid_to_record.items():
+			summary = await archiveClient.get_object_summary(record.key)
+			if not summary.get("exists"):
+				return Response(status_code=404,
+								content=f"Stored content not available for message: {message_uuid}",
+								headers=resp_headers)
 
-    # ---- authenticated: every return below carries resp_headers ----
-    if error is not None:
-        return Response(status_code=error[0], content=error[1], headers=resp_headers)
-    if missing:
-        return Response(status_code=404, content=f"No such message(s): {', '.join(missing)}",
-                        headers=resp_headers)
+		published = await archiveClient.mint_doi(zenodo_metadata, message_uuids, created_by=username)
+	except zenodo_client.ZenodoNotConfiguredError as e:
+		return Response(status_code=501, content=str(e), headers=resp_headers)
+	except zenodo_client.ZenodoError as e:
+		logging.error(f"DOI minting failed for {username}: {e}")
+		return Response(status_code=502, content=str(e), headers=resp_headers)
+	except Exception:
+		# Anything unexpected must still carry the headers, or the client crashes
+		# with a confusing SCRAM error instead of showing the real failure.
+		logging.exception(f"Unexpected error minting DOI for {username}")
+		return Response(status_code=500, content="Internal error while minting DOI",
+						headers=resp_headers)
 
-    for topic in distinct_topics:
-        if not _has_read_permission(hop_json, topic):
-            return Response(status_code=403, content=f"Read permission required on topic '{topic}'",
-                            headers=resp_headers)
-
-    whoami = hop_json.get("whoami", {})
-    if whoami.get("status") != 200 or "username" not in whoami.get("body", {}):
-        return Response(status_code=403, content="Forbidden", headers=resp_headers)
-    username = whoami["body"]["username"]
-
-    if not zenodo_client.is_configured(config):
-        return Response(status_code=501,
-                        content="Zenodo minting is not configured on this archive instance",
-                        headers=resp_headers)
-
-    try:
-        # Check every message's content is in the store BEFORE creating anything on Zenodo.
-        unavailable = []
-        for message_uuid, record in uuid_to_record.items():
-            summary = await archiveClient.get_object_summary(record.key)
-            if not summary.get("exists"):
-                unavailable.append(message_uuid)
-        if unavailable:
-            return Response(status_code=404,
-                            content=f"Stored content not available for message(s): {', '.join(unavailable)}",
-                            headers=resp_headers)
-
-        published = await archiveClient.mint_doi(config, zenodo_metadata, candidate_uuids,
-                                                 created_by=username)
-    except zenodo_client.ZenodoNotConfiguredError as e:
-        return Response(status_code=501, content=str(e), headers=resp_headers)
-    except zenodo_client.ZenodoError as e:
-        logging.error(f"DOI minting failed for {username}: {e}")
-        return Response(status_code=502, content=str(e), headers=resp_headers)
-    except Exception:
-        # Anything unexpected must still carry the headers, or the client crashes
-        # with a confusing SCRAM error instead of showing the real failure.
-        logging.exception(f"Unexpected error minting DOI for {username}")
-        return Response(status_code=500, content="Internal error while minting DOI",
-                        headers=resp_headers)
-
-    return JSONResponse(
-        content={"doi": published["doi"], "record_url": published["links"]["record_html"]},
-        status_code=201,
-        headers=resp_headers,
-    )
+	return _bson_response({"doi": published["doi"], "record_url": published["links"]["record_html"]},
+						  resp_headers, status_code=201)
