@@ -1549,6 +1549,175 @@ async def count_messages(request: Request,
 	return Response(content=bson.dumps({"count":n}), headers=resp_headers)
 
 
+@app.put("/msg/{msg_id}/make_public",
+         description="Make a message permanently public",
+         response_class=Response,
+         responses={
+             200: {
+                 "description": "Success",
+             },
+             400: {
+                 "description": "Bad request. This may be caused by an ill-formed message ID.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string",
+                             "examples": ["Invalid Message ID"]
+                         }
+                     }
+                 }
+             },
+             401: {
+                 "description": "Authentication required.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string",
+                             "examples": ["Authentication required"]
+                         }
+                     }
+                 }
+             },
+             403: {
+                 "description": "Not authorized. The authenticated user does not have access to the requested message.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string",
+                             "examples": ["Operation not permitted"]
+                         }
+                     }
+                 }
+             },
+             404: {
+                 "description": "Message not found. There is no archived message with the specified ID.",
+                 "content": {
+                     "text/plain": {
+                         "schema": {
+                             "type": "string",
+                             "examples": ["Message not found"]
+                         }
+                     }
+                 }
+             },
+         })
+async def make_message_public(request: Request,
+                              msg_id: Annotated[str, Path(description="The ID of the target message", 
+                                                          json_schema_extra={"type": "string", "format": "uuid", "examples": ["457E145B-9F72-416F-87CA-73F0E188183D"]})],
+                          authorization: Annotated[Union[str, None], Header(description="RFC 7804 SCRAM authentication")] = None,
+                          ):
+	resp_headers: dict[str,str]={}
+	
+	# First, make sure the message ID supplied by user is something safe and sane
+	try:
+		# overwrite the variable to normalize
+		msg_id = uuid.UUID(msg_id)
+	except ValueError:
+		return Response(status_code=400, content="Invalid Message ID")
+	
+	# Get the record, if any, of the message
+	metadata = await archiveClient.get_metadata(msg_id)
+	if not metadata:
+		return Response(status_code=404, content="Message not found")
+	
+	logging.debug(f"message lives at key {metadata.key} in bucket {metadata.bucket} "
+	              f"and was on topic {metadata.topic}")
+	
+	if metadata.public: # message is already public, nothing to do
+	    return Response(status_code=200)
+	
+	# Query hopauth to find out if the user is allowed to manipulate this message.
+	# This requires authenticating the user to hopauth.
+	if authorization is None:
+		return authentication_required();
+	
+	path_root=urlparse(config['hopauth_api_url']).path
+	topic_name = effective_topic_name_for_access(metadata.topic)
+	resp = await httpClient.post(config['hopauth_api_url']+"/v1/multi",
+							 json={
+							   "ops":{
+								 "method":"get",
+								 "path":f"{path_root}/v1/current_credential/permissions/topic/{topic_name}",
+								 "headers":{"Authorization": "Inherit"},
+							   },
+							   "topic":{
+								 "method":"get",
+								 "path":f"{path_root}/v1/topics/{topic_name}",
+								 "headers":{"Authorization": "Inherit"},
+							   },
+							   "whoami":{
+								 "method":"get",
+								 "path":f"{path_root}/v1/current_user",
+								 "headers":{"Authorization": "Inherit"},
+							   },
+							   "cred":{
+								 "method":"get",
+								 "path":f"{path_root}/v1/current_credential",
+								 "headers":{"Authorization": "Inherit"},
+							   },
+							 },
+							 headers={"Authorization": authorization}
+							 )
+	
+	if resp.status_code == 401 and "www-authenticate" in resp.headers:
+		return Response(status_code=401, content=resp.content, 
+						headers={"www-authenticate": resp.headers["www-authenticate"]})
+	if resp.status_code == 403:
+		return Response(status_code=403, content="Forbidden")
+	if resp.status_code != 200:
+		logging.info(f"MAKE_MESSAGE_PUBLIC request by {user_id} from {request.client.host} for message {msg_id}")
+		logging.error("hop_auth API error: {resp.status_code}")
+		return Response(status_code=500, content="Internal Error: hop_auth API request failed")
+	if "authentication-info" in resp.headers:
+		resp_headers["authentication-info"] = resp.headers["authentication-info"]
+	# After this point it is important to always return a response with resp_headers
+	# as the client may be expecting the authentication-info!
+	
+	hop_json = resp.json()
+	if hop_json["whoami"]["status"]==200 and "body" in hop_json["whoami"] \
+		  and "username" in hop_json["whoami"]["body"] and "email" in hop_json["whoami"]["body"]:
+			user_id = f"user {hop_json['whoami']['body']['username']} ({hop_json['whoami']['body']['email']})"
+	
+	if hop_json["ops"]["status"]!=200 or hop_json["topic"]["status"]!=200:
+		if hop_json["ops"]["status"]>=400 and hop_json["ops"]["status"]<=499:
+			return Response(status_code=hop_json["ops"]["status"], 
+			                content="hop_auth API permissions sub-request failed "
+			                        f"({hop_json['ops']['status']}): {hop_json['ops'].get('body')}", 
+			                headers=resp_headers)
+		if hop_json["topic"]["status"]>=400 and hop_json["topic"]["status"]<=499:
+			return Response(status_code=hop_json["topic"]["status"], 
+			                content="hop_auth API topic sub-request failed "
+			                        f"({hop_json['topic']['status']}): {hop_json['topic'].get('body')}", 
+			                headers=resp_headers)
+		logging.info(f"MAKE_MESSAGE_PUBLIC request by {user_id} from {request.client.host} for message {msg_id}")
+		logging.error("Error from hop_auth API: \n"
+		              f"Permissions ({hop_json['ops']['status']}): {hop_json['ops'].get('body')}\n"
+		              f"Topic ({hop_json['topic']['status']}): {hop_json['topic'].get('body')}"
+		              )
+		return Response(status_code=500, content="Internal Error: hop_auth API sub-request failed", headers=resp_headers)
+	
+	logging.info(f"MAKE_MESSAGE_PUBLIC request by {user_id} from {request.client.host} for message {msg_id}")
+	
+	if "body" not in hop_json["ops"] or not isinstance(hop_json["ops"]["body"], collections.abc.Mapping) \
+	  or "allowed_operations" not in hop_json["ops"]["body"] \
+	  or not isinstance(hop_json["ops"]["body"]["allowed_operations"], collections.abc.Sequence) \
+	  or "body" not in hop_json["topic"] or not isinstance(hop_json["topic"]["body"], collections.abc.Mapping) \
+	  or "publicly_readable" not in hop_json["topic"]["body"]:
+		return Response(status_code=500, content="Internal Error: Malformed response from hop_auth API", headers=resp_headers)
+
+	if not has_permission(hop_json["ops"]["body"]["allowed_operations"], "Write"):
+		return Response(status_code=403, content="Operation not permitted", headers=resp_headers)
+	
+	# at this point we know the user is allowed to write, so the change can go ahead
+	try:
+		await archiveClient.make_message_public(msg_id)
+	except:
+		logging.exception("Failed to set message public flag")
+		return Response(status_code=500, content="Internal Error: Failed to make message public",
+		                headers=resp_headers)
+	return Response(status_code=200, headers=resp_headers)
+
+
 @app.put("/msg/{msg_id}/retraction",
          description="Set a message's retraction status",
          response_class=Response,
